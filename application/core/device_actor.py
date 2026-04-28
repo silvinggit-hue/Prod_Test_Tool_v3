@@ -50,12 +50,59 @@ class DeviceActor:
         self.current_task_id: str | None = None
         self.current_task_kind: str | None = None
         self.pending_count: int = 0
+        self._disconnect_hold: bool = False
 
     def is_busy(self) -> bool:
         return self.current_task_id is not None
 
     def can_accept_task(self, task: TaskSpec) -> bool:
         return not self.is_busy()
+
+    def has_session(self) -> bool:
+        if self._disconnect_hold:
+            return False
+        if self.session is not None:
+            return True
+        snapshot = self.registry.get_snapshot(self.ip)
+        if snapshot is None:
+            return False
+        return bool(snapshot.base_url and snapshot.root_path and snapshot.auth_scheme)
+
+    def disconnect(self, *, reason: str = "연결 해제됨") -> None:
+        self._disconnect_hold = True
+
+        if self.session is not None:
+            try:
+                self.session.close()
+            except Exception:
+                pass
+        self.session = None
+
+        snapshot = self.registry.require_snapshot(self.ip)
+
+        new_command = replace(
+            snapshot.command,
+            last_message=reason,
+            last_error_kind="",
+            last_error_detail="",
+            progress_text="" if not self.is_busy() else snapshot.command.progress_text,
+        )
+        if not self.is_busy():
+            new_command = replace(
+                new_command,
+                inflight=False,
+                current_task_id=None,
+                current_task_kind=None,
+            )
+
+        updated = replace(
+            snapshot,
+            connected=False,
+            state=DeviceState.DISCONNECTED,
+            command=new_command,
+        )
+        self.registry.upsert_snapshot(updated)
+        self.ui_update_bus.mark_device_dirty(self.ip)
 
     def begin_task(self, task: TaskSpec) -> None:
         if self.is_busy():
@@ -87,8 +134,6 @@ class DeviceActor:
     ) -> None:
         snapshot = self.registry.require_snapshot(self.ip)
 
-        # Step 4 최종 수정 반영:
-        # generic message가 control-specific message를 덮어쓰지 않도록 기존 last_message 유지
         keep_message = snapshot.command.last_message
         final_message = keep_message or message
 
@@ -113,6 +158,10 @@ class DeviceActor:
         self.ui_update_bus.mark_device_dirty(self.ip)
 
     def execute_task(self, task: TaskSpec) -> None:
+        if self._disconnect_hold and task.command != CommandKind.CONNECT:
+            self.ui_update_bus.mark_device_dirty(self.ip)
+            return
+
         self.begin_task(task)
         try:
             if task.command == CommandKind.CONNECT:
@@ -146,7 +195,7 @@ class DeviceActor:
 
         if error.kind == "auth":
             new_state = DeviceState.AUTH_FAILED
-        elif error.kind in ("timeout", "network", "http"):
+        elif error.kind in ("timeout", "network", "http", "disconnect"):
             new_state = DeviceState.DISCONNECTED
 
         updated = replace(snapshot, state=new_state, connected=(new_state == DeviceState.READY))
@@ -163,6 +212,7 @@ class DeviceActor:
         if not response.ok:
             raise response.error or AppError(kind="auth", message="connect failed")
 
+        self._disconnect_hold = False
         self.session = DeviceSession.from_phase1(response)
 
         snapshot = self.registry.require_snapshot(self.ip)
@@ -188,6 +238,9 @@ class DeviceActor:
         self.ui_update_bus.mark_device_dirty(self.ip)
 
     def _require_session(self) -> DeviceSession:
+        if self._disconnect_hold:
+            raise AppError(kind="disconnect", message="device is disconnected", detail=self.ip)
+
         if self.session is None:
             snapshot = self.registry.require_snapshot(self.ip)
             if snapshot.base_url and snapshot.root_path and snapshot.auth_scheme:
@@ -215,8 +268,10 @@ class DeviceActor:
             )
         )
         result = self.info_repository.read_info_kv(client)
-        kv = result.merged_kv
+        if self._disconnect_hold:
+            return
 
+        kv = result.merged_kv
         snapshot = self.registry.require_snapshot(self.ip)
 
         updated = replace(
@@ -233,21 +288,16 @@ class DeviceActor:
             module_detail=(kv.get("SYS_MODULE_DETAIL") or snapshot.module_detail).strip(),
             ptz_type=(kv.get("SYS_PTZ_TYPE") or snapshot.ptz_type).strip(),
             zoom_module=(kv.get("SYS_ZOOMMODULE") or snapshot.zoom_module).strip(),
-
             sys_mode_text=format_display_value("SYS_MODE", kv.get("SYS_MODE")),
             module_version=(kv.get("CAM_READMODULEVERSION") or snapshot.module_version).strip() or "-",
             ptz_fw=(kv.get("CAM_READMECAVERSION") or snapshot.ptz_fw).strip() or "-",
-
-            # 기존 extra_id 대신 LD
             linkdown_num=(kv.get("SYS_LINKDOWN_NUM") or snapshot.linkdown_num).strip() or "-",
-
             local_ip_mode=format_display_value("NET_LOCALIPMODE", kv.get("NET_LOCALIPMODE")),
             power_type=(kv.get("TEST_Power_CheckString") or snapshot.power_type).strip() or "-",
             startup_time=(kv.get("SYS_STARTTIME") or snapshot.startup_time).strip() or "-",
             disk_text=build_disk_text(kv),
             ai_version=(kv.get("SYS_AI_VERSION") or snapshot.ai_version).strip() or "-",
             rcv_version=(kv.get("SYS_RCV_VERSION") or snapshot.rcv_version).strip() or "-",
-
             last_success_at=time.time(),
         )
         self.registry.upsert_snapshot(updated)
@@ -262,6 +312,9 @@ class DeviceActor:
             )
         )
         result = self.status_repository.read_status_kv(client)
+        if self._disconnect_hold:
+            return
+
         kv = result.merged_kv
 
         def first(*keys: str) -> str:
@@ -277,10 +330,7 @@ class DeviceActor:
             snapshot.metrics,
             rtc_text=first("SYS_CURRENTTIME"),
             temp_text=first("SYS_BOARDTEMP", "SYS_BOARD_TEMP", "ETC_BOARDTEMP"),
-
-            # Ethernet: raw ETHTOOL 말고 사람이 읽는 값
             eth_text=self._format_ethernet_text(kv),
-
             rate1_text=self._build_rate_text(kv, 1),
             rate2_text=self._build_rate_text(kv, 2),
             rate3_text=self._build_rate_text(kv, 3),
@@ -289,15 +339,10 @@ class DeviceActor:
             audio_dec_bitrate=first("GRS_ADECBITRATE1"),
             audio_dec_algorithm=first("GRS_ADECALGORITHM1"),
             audio_dec_samplerate=first("GRS_ADECSAMPLERATE1"),
-
-            # CDS 보정
             cds_text=self._pick_cds_text(kv),
-
-            # Current Y는 "Current Value 81 CDS Value 0" 같은 raw에서 숫자만 추출
             current_y_text=self._parse_current_y_value(
                 first("CAM_HI_CURRENT_Y", "CAM_NXP_CURRENT_Y", "CAM_AMBA_CURRENT_Y")
             ),
-
             fan_text=first("SYS_FANSTATUS", "SYS_FAN_STATUS", "FAN_STATUS"),
             sensor_leds=self._tuple_leds(kv, "GIS_SENSOR"),
             alarm_leds=self._tuple_leds(kv, "GIS_ALARM"),
@@ -310,10 +355,7 @@ class DeviceActor:
             connected=True,
             metrics=metrics,
             air_wiper=(kv.get("GIS_AIRWIPER") or snapshot.air_wiper).strip() or "-",
-
-            # Ethernet Speed Rate는 속도만 보관
             ethernet_speed_rate=self._format_link_speed_from_ethtool(kv.get("ETHTOOL")),
-
             last_success_at=time.time(),
         )
         self.registry.upsert_snapshot(updated)
@@ -339,11 +381,10 @@ class DeviceActor:
             raise AppError(kind="param", message="unknown control handler", detail=handler_name)
 
         result = handler(client, **kwargs)
+        if self._disconnect_hold:
+            return
 
         snapshot = self.registry.require_snapshot(self.ip)
-
-        # Step 4 최종 수정 반영:
-        # 실제 control 종류별 완료 메시지를 유지
         completed_message = f"{handler_name} completed"
 
         updated = replace(
@@ -359,9 +400,6 @@ class DeviceActor:
         )
         self.registry.upsert_snapshot(updated)
         self.ui_update_bus.mark_device_dirty(self.ip)
-
-    def has_session(self) -> bool:
-        return self.session is not None
 
     @staticmethod
     def _tuple_leds(kv: dict[str, str], prefix: str) -> tuple[bool, bool, bool, bool]:
@@ -419,8 +457,8 @@ class DeviceActor:
     @classmethod
     def _format_ethernet_text(cls, kv: dict[str, str]) -> str:
         link_state = (
-                (kv.get("NET_LINKSTATE") or "")
-                or (kv.get("NET_LINK_STATE") or "")
+            (kv.get("NET_LINKSTATE") or "")
+            or (kv.get("NET_LINK_STATE") or "")
         ).strip().lower()
 
         state_text = "link"
@@ -432,10 +470,10 @@ class DeviceActor:
         speed_text = cls._format_link_speed_from_ethtool(kv.get("ETHTOOL"))
         if speed_text == "-":
             speed_text = (
-                                 (kv.get("NET_LINKSPEED") or "")
-                                 or (kv.get("NET_LINK_SPEED") or "")
-                                 or "-"
-                         ).strip() or "-"
+                (kv.get("NET_LINKSPEED") or "")
+                or (kv.get("NET_LINK_SPEED") or "")
+                or "-"
+            ).strip() or "-"
 
         if speed_text == "-":
             return state_text
@@ -444,7 +482,6 @@ class DeviceActor:
 
     @staticmethod
     def _pick_cds_text(kv: dict[str, str]) -> str:
-        # as_test_tool 계열 우선순위: SYS_FTCAMERA_CDS -> GIS_CDS 계열
         for key in ("SYS_FTCAMERA_CDS", "GIS_CDS", "GIS_CDS_CUR", "GIS_CDS_CURRENT"):
             value = (kv.get(key) or "").strip()
             if value:

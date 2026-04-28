@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PyQt5.QtWidgets import QGroupBox, QTextEdit, QVBoxLayout
+from PyQt5.QtWidgets import QGroupBox, QTextEdit, QVBoxLayout, QSizePolicy
 
 
 class ResultPanel(QGroupBox):
@@ -9,8 +9,13 @@ class ResultPanel(QGroupBox):
 
         self.text_edit = QTextEdit()
         self.text_edit.setReadOnly(True)
+        self.text_edit.setMinimumHeight(78)
+        self.text_edit.setMaximumHeight(90)
+        self.text_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(2)
         layout.addWidget(self.text_edit)
 
     def set_text(self, text: str) -> None:

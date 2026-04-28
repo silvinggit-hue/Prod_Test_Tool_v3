@@ -7,7 +7,7 @@ from PyQt5.QtCore import QItemSelection, QItemSelectionModel, QModelIndex, QSign
 from PyQt5.QtWidgets import QMessageBox
 
 from application.core.app_supervisor import AppSupervisor
-from domain.enums.device import DeviceFlavor
+from domain.enums.device import DeviceFlavor, DeviceState
 from domain.models.phase1 import Phase1Request
 from ui.add_device.controller import AddDeviceController
 from ui.add_device.window import AddDeviceWindow
@@ -17,6 +17,22 @@ from ui.main.window import MainWindow
 
 
 class MainWindowController:
+    BATCH_ALLOWED_HANDLERS = {
+        "set_tdn",
+        "set_icr",
+        "set_air_wiper",
+        "set_sensor_485",
+        "set_shock_sensor",
+        "reboot",
+        "factory_reset",
+        "set_model_name",
+        "set_rtc",
+        "set_extra_id",
+        "apply_secondary_video",
+        "set_min_focus_length",
+        "apply_audio_profile",
+        "set_video_input_format",
+    }
 
     @staticmethod
     def _sort_snapshots_asc_by_ip(snapshots):
@@ -46,10 +62,12 @@ class MainWindowController:
         self.window.clear_selection_action.triggered.connect(self._on_clear_selection_clicked)
 
         self.window.connect_panel.connect_selected_button.clicked.connect(self._on_connect_selected_clicked)
+        self.window.connect_panel.disconnect_selected_button.clicked.connect(self._on_disconnect_selected_clicked)
+
         self.window.info_panel.load_info_button.clicked.connect(self._on_load_info_clicked)
         self.window.status_panel.poll_status_button.clicked.connect(self._on_poll_status_clicked)
-        self.window.control_panel.reboot_button.clicked.connect(self._on_reboot_clicked)
-        self.window.control_panel.sync_rtc_button.clicked.connect(self._on_sync_rtc_clicked)
+
+        self._bind_control_panel()
 
         self.window.device_table.selectionModel().selectionChanged.connect(self._on_table_selection_changed)
         self.window.device_table.doubleClicked.connect(self._on_table_double_clicked)
@@ -62,6 +80,76 @@ class MainWindowController:
         self._ui_timer.start()
 
         self.refresh_all()
+
+    def _bind_control_panel(self) -> None:
+        panel = self.window.control_panel
+
+        panel.single_mode_radio.toggled.connect(self._refresh_target_summary)
+        panel.batch_mode_radio.toggled.connect(self._refresh_target_summary)
+
+        panel.pt_leftup_button.pressed.connect(lambda: self._on_pt_press("leftup"))
+        panel.pt_leftup_button.released.connect(self._on_pt_release)
+
+        panel.pt_up_button.pressed.connect(lambda: self._on_pt_press("up"))
+        panel.pt_up_button.released.connect(self._on_pt_release)
+
+        panel.pt_rightup_button.pressed.connect(lambda: self._on_pt_press("rightup"))
+        panel.pt_rightup_button.released.connect(self._on_pt_release)
+
+        panel.pt_left_button.pressed.connect(lambda: self._on_pt_press("left"))
+        panel.pt_left_button.released.connect(self._on_pt_release)
+
+        panel.pt_right_button.pressed.connect(lambda: self._on_pt_press("right"))
+        panel.pt_right_button.released.connect(self._on_pt_release)
+
+        panel.pt_leftdown_button.pressed.connect(lambda: self._on_pt_press("leftdown"))
+        panel.pt_leftdown_button.released.connect(self._on_pt_release)
+
+        panel.pt_down_button.pressed.connect(lambda: self._on_pt_press("down"))
+        panel.pt_down_button.released.connect(self._on_pt_release)
+
+        panel.pt_rightdown_button.pressed.connect(lambda: self._on_pt_press("rightdown"))
+        panel.pt_rightdown_button.released.connect(self._on_pt_release)
+
+        panel.zoom_in_button.pressed.connect(lambda: self._on_zoom_press("in"))
+        panel.zoom_in_button.released.connect(self._on_zoom_release)
+        panel.zoom_out_button.pressed.connect(lambda: self._on_zoom_press("out"))
+        panel.zoom_out_button.released.connect(self._on_zoom_release)
+        panel.zoom_1x_button.clicked.connect(lambda: self._on_zoom_clicked("1x"))
+
+        panel.focus_near_button.pressed.connect(lambda: self._on_focus_press("near"))
+        panel.focus_near_button.released.connect(self._on_focus_release)
+        panel.focus_far_button.pressed.connect(lambda: self._on_focus_press("far"))
+        panel.focus_far_button.released.connect(self._on_focus_release)
+        panel.focus_auto_button.clicked.connect(lambda: self._on_focus_clicked("auto"))
+
+        panel.tdn_day_button.clicked.connect(lambda: self._on_tdn_clicked("day"))
+        panel.tdn_night_button.clicked.connect(lambda: self._on_tdn_clicked("night"))
+        panel.tdn_auto_button.clicked.connect(lambda: self._on_tdn_clicked("auto"))
+
+        panel.icr_on_button.clicked.connect(lambda: self._on_icr_clicked("on"))
+        panel.icr_off_button.clicked.connect(lambda: self._on_icr_clicked("off"))
+        panel.icr_auto_button.clicked.connect(lambda: self._on_icr_clicked("auto"))
+
+        panel.air_wiper_on_button.clicked.connect(lambda: self._on_air_wiper_clicked("on"))
+        panel.air_wiper_off_button.clicked.connect(lambda: self._on_air_wiper_clicked("off"))
+
+        panel.model_apply_button.clicked.connect(self._on_model_apply_clicked)
+        panel.extra_id_apply_button.clicked.connect(self._on_extra_id_apply_clicked)
+        panel.sync_rtc_button.clicked.connect(self._on_sync_rtc_clicked)
+
+        panel.secondary_video_button.clicked.connect(self._on_secondary_video_clicked)
+        panel.video_input_apply_button.clicked.connect(self._on_video_input_apply_clicked)
+        panel.min_focus_apply_button.clicked.connect(self._on_min_focus_apply_clicked)
+        panel.sensor_485_on_button.clicked.connect(lambda: self._on_sensor_485_clicked("on"))
+        panel.sensor_485_off_button.clicked.connect(lambda: self._on_sensor_485_clicked("off"))
+        panel.shock_sensor_on_button.clicked.connect(lambda: self._on_shock_sensor_clicked("on"))
+        panel.shock_sensor_off_button.clicked.connect(lambda: self._on_shock_sensor_clicked("off"))
+        panel.audio_apply_button.clicked.connect(self._on_audio_apply_clicked)
+        panel.audio_max_volume_button.clicked.connect(self._on_audio_max_volume_clicked)
+
+        panel.reboot_button.clicked.connect(self._on_reboot_clicked)
+        panel.factory_reset_button.clicked.connect(self._on_factory_reset_clicked)
 
     def _on_ui_refresh_tick(self) -> None:
         batch = self.supervisor.flush_ui_updates()
@@ -89,6 +177,8 @@ class MainWindowController:
 
         self.window.info_panel.set_snapshot(focus_snapshot)
         self.window.status_panel.set_snapshot(focus_snapshot)
+        self.window.control_panel.set_video_input_context(focus_snapshot)
+        self._refresh_target_summary()
 
     def _append_log(self, text: str) -> None:
         self.window.log_panel.append_line(text)
@@ -201,12 +291,15 @@ class MainWindowController:
 
         self.refresh_all()
 
-    def _current_target_ips(self) -> list[str]:
-        checked_ips = [
+    def _checked_ips(self) -> list[str]:
+        return [
             snapshot.ip
             for snapshot in self.supervisor.registry.list_snapshots()
             if snapshot.selected
         ]
+
+    def _current_target_ips(self) -> list[str]:
+        checked_ips = self._checked_ips()
         if checked_ips:
             return checked_ips
 
@@ -219,6 +312,16 @@ class MainWindowController:
             return [focused]
 
         return []
+
+    def _single_target_ip(self) -> str | None:
+        targets = self._current_target_ips()
+        return targets[0] if targets else None
+
+    def _refresh_target_summary(self) -> None:
+        current_ip = self._single_target_ip()
+        checked_count = len(self._checked_ips())
+        self.window.connect_panel.set_target_summary(current_ip, checked_count)
+        self.window.control_panel.set_target_summary(current_ip, checked_count)
 
     def _apply_probe_metadata(self, ip: str, probe: dict | None) -> None:
         if not probe:
@@ -321,18 +424,18 @@ class MainWindowController:
     def _on_connect_selected_clicked(self) -> None:
         target_ips = self._current_target_ips()
         if not target_ips:
-            self._show_error("Connect", "체크되었거나 선택된 장비가 없습니다.")
+            self._show_error("연결", "체크되었거나 선택된 장비가 없습니다.")
             return
 
         entered_username = self.window.connect_panel.entered_username().strip()
         entered_password = self.window.connect_panel.entered_password().strip()
 
         if not entered_username:
-            self._show_error("Connect", "ID를 입력하세요.")
+            self._show_error("연결", "아이디를 입력하세요.")
             return
 
         if not entered_password:
-            self._show_error("Connect", "현재 비밀번호를 입력하세요.")
+            self._show_error("연결", "현재 비밀번호를 입력하세요.")
             return
 
         requests: list[tuple[str, Phase1Request]] = []
@@ -344,14 +447,59 @@ class MainWindowController:
                 f"pw={request.password} target={request.target_password} tls={request.verify_tls}"
             )
 
-        batch_id = self.supervisor.enqueue_connect_batch(requests, auto_info=True)
-        self._append_log(f"connect batch queued: batch_id={batch_id} count={len(requests)}")
-        self._append_result(f"Connect 시작: {len(requests)}대 / batch={batch_id}")
+        if hasattr(self.supervisor, "enqueue_connect_batch"):
+            batch_id = self.supervisor.enqueue_connect_batch(requests, auto_info=True)
+            self._append_log(f"connect batch queued: batch_id={batch_id} count={len(requests)}")
+            self._append_result(f"연결 시작: {len(requests)}대 / batch={batch_id}")
+        else:
+            for ip, request in requests:
+                self.supervisor.enqueue_connect(ip, request)
+            self._append_log(f"connect queued: count={len(requests)}")
+            self._append_result(f"연결 시작: {len(requests)}대")
+
+    def _disconnect_targets(self, ips: list[str], *, reason: str = "연결 해제됨") -> int:
+        count = 0
+        for ip in ips:
+            snapshot = self.supervisor.get_snapshot(ip)
+            actor = self._actor_for_ip(ip)
+
+            if actor is not None and hasattr(actor, "disconnect"):
+                actor.disconnect(reason=reason)
+                count += 1
+                continue
+
+            if snapshot is not None:
+                self.supervisor.registry.update_snapshot(
+                    ip,
+                    connected=False,
+                    state=DeviceState.DISCONNECTED,
+                )
+                count += 1
+
+        self.refresh_all()
+        return count
+
+    def _on_disconnect_selected_clicked(self) -> None:
+        target_ips = self._current_target_ips()
+        if not target_ips:
+            self._show_error("연결 해제", "체크되었거나 선택된 장비가 없습니다.")
+            return
+
+        if QMessageBox.question(
+            self.window,
+            "연결 해제",
+            f"선택 장비 {len(target_ips)}대의 작업을 멈추고 연결을 해제하시겠습니까?",
+        ) != QMessageBox.Yes:
+            return
+
+        count = self._disconnect_targets(target_ips, reason="사용자 연결 해제")
+        self._append_log(f"disconnect applied: {count}")
+        self._append_result(f"연결 해제 완료: {count}대")
 
     def _on_load_info_clicked(self) -> None:
         target_ips = self._current_target_ips()
         if not target_ips:
-            self._show_error("Load Info", "체크되었거나 선택된 장비가 없습니다.")
+            self._show_error("정보 읽기", "체크되었거나 선택된 장비가 없습니다.")
             return
 
         queued = 0
@@ -376,12 +524,12 @@ class MainWindowController:
             queued += 1
 
         if queued == 0:
-            self._show_error("Load Info", "연결 성공한 장비가 없습니다.")
+            self._show_error("정보 읽기", "연결 성공한 장비가 없습니다.")
 
     def _on_poll_status_clicked(self) -> None:
         target_ips = self._current_target_ips()
         if not target_ips:
-            self._show_error("Poll Status", "체크되었거나 선택된 장비가 없습니다.")
+            self._show_error("상태 읽기", "체크되었거나 선택된 장비가 없습니다.")
             return
 
         queued = 0
@@ -406,27 +554,318 @@ class MainWindowController:
             queued += 1
 
         if queued == 0:
-            self._show_error("Poll Status", "연결 성공한 장비가 없습니다.")
+            self._show_error("상태 읽기", "연결 성공한 장비가 없습니다.")
 
-    def _on_reboot_clicked(self) -> None:
-        target_ips = self._current_target_ips()
+    def _resolve_control_target_ips(
+        self,
+        *,
+        single_only: bool = False,
+        require_connected: bool = True,
+        require_session: bool = True,
+        action_name: str = "제어",
+        show_error_if_empty: bool = True,
+    ) -> list[str]:
+        mode = self.window.control_panel.control_mode()
+
+        if single_only:
+            source_ips = self._current_target_ips()[:1]
+        elif mode == "batch":
+            source_ips = self._checked_ips()
+        else:
+            source_ips = self._current_target_ips()[:1]
+
+        if not source_ips:
+            if show_error_if_empty:
+                if single_only or mode == "single":
+                    self._show_error(action_name, "현재 장비가 없습니다.")
+                else:
+                    self._show_error(action_name, "전체 제어 대상이 없습니다. 체크박스로 장비를 선택하세요.")
+            return []
+
+        resolved: list[str] = []
+        for ip in source_ips:
+            snapshot = self.supervisor.get_snapshot(ip)
+            actor = self._actor_for_ip(ip)
+
+            if snapshot is None:
+                self._append_log(f"{action_name} skipped (no snapshot): {ip}")
+                continue
+
+            if require_connected and not snapshot.connected:
+                self._append_log(f"{action_name} skipped (not connected): {ip}")
+                continue
+
+            if require_session and actor is not None and hasattr(actor, "has_session") and not actor.has_session():
+                self._append_log(f"{action_name} skipped (no session): {ip}")
+                continue
+
+            resolved.append(ip)
+
+        if not resolved and show_error_if_empty:
+            self._show_error(action_name, "실행 가능한 연결 장비가 없습니다.")
+
+        return resolved
+
+    def _enqueue_control_for_targets(
+        self,
+        *,
+        handler: str,
+        kwargs: dict | None = None,
+        action_name: str,
+        single_only: bool = False,
+        confirm_text: str | None = None,
+        show_error_if_empty: bool = True,
+    ) -> None:
+        if not single_only and self.window.control_panel.control_mode() == "batch":
+            if handler not in self.BATCH_ALLOWED_HANDLERS:
+                self._show_error(action_name, "이 기능은 현재 장비 1대만 제어할 수 있습니다.")
+                return
+
+        if confirm_text:
+            if QMessageBox.question(self.window, action_name, confirm_text) != QMessageBox.Yes:
+                return
+
+        target_ips = self._resolve_control_target_ips(
+            single_only=single_only,
+            require_connected=True,
+            require_session=True,
+            action_name=action_name,
+            show_error_if_empty=show_error_if_empty,
+        )
         if not target_ips:
-            self._show_error("Reboot", "체크되었거나 선택된 장비가 없습니다.")
             return
 
         for ip in target_ips:
-            self.supervisor.enqueue_control(ip, handler="reboot", kwargs={})
-            self._append_log(f"reboot queued: {ip}")
+            self.supervisor.enqueue_control(ip, handler=handler, kwargs=dict(kwargs or {}))
+            self._append_log(f"{handler} queued: {ip}")
+
+        self._append_result(f"{action_name} 실행: {len(target_ips)}대")
+
+    def _on_pt_press(self, action: str) -> None:
+        self._enqueue_control_for_targets(
+            handler="pt",
+            kwargs={"action": action, "speed": 5},
+            action_name="PT 제어",
+            single_only=True,
+            show_error_if_empty=True,
+        )
+
+    def _on_pt_release(self) -> None:
+        self._enqueue_control_for_targets(
+            handler="pt",
+            kwargs={"action": "stop", "speed": 5},
+            action_name="PT 정지",
+            single_only=True,
+            show_error_if_empty=False,
+        )
+
+    def _on_zoom_press(self, action: str) -> None:
+        self._enqueue_control_for_targets(
+            handler="zoom",
+            kwargs={"action": action},
+            action_name="Zoom 제어",
+            single_only=True,
+            show_error_if_empty=True,
+        )
+
+    def _on_zoom_release(self) -> None:
+        self._enqueue_control_for_targets(
+            handler="zoom",
+            kwargs={"action": "stop"},
+            action_name="Zoom 정지",
+            single_only=True,
+            show_error_if_empty=False,
+        )
+
+    def _on_zoom_clicked(self, action: str) -> None:
+        self._enqueue_control_for_targets(
+            handler="zoom",
+            kwargs={"action": action},
+            action_name="Zoom 제어",
+            single_only=True,
+        )
+
+    def _on_focus_press(self, action: str) -> None:
+        self._enqueue_control_for_targets(
+            handler="focus",
+            kwargs={"action": action},
+            action_name="Focus 제어",
+            single_only=True,
+            show_error_if_empty=True,
+        )
+
+    def _on_focus_release(self) -> None:
+        self._enqueue_control_for_targets(
+            handler="focus",
+            kwargs={"action": "stop"},
+            action_name="Focus 정지",
+            single_only=True,
+            show_error_if_empty=False,
+        )
+
+    def _on_focus_clicked(self, action: str) -> None:
+        self._enqueue_control_for_targets(
+            handler="focus",
+            kwargs={"action": action},
+            action_name="Focus 제어",
+            single_only=True,
+        )
+
+    def _on_tdn_clicked(self, action: str) -> None:
+        self._enqueue_control_for_targets(
+            handler="set_tdn",
+            kwargs={"action": action},
+            action_name="TDN 변경",
+        )
+
+    def _on_icr_clicked(self, action: str) -> None:
+        self._enqueue_control_for_targets(
+            handler="set_icr",
+            kwargs={"action": action},
+            action_name="ICR 변경",
+        )
+
+    def _on_air_wiper_clicked(self, action: str) -> None:
+        self._enqueue_control_for_targets(
+            handler="set_air_wiper",
+            kwargs={"action": action},
+            action_name="Air Wiper 변경",
+        )
+
+    def _on_model_apply_clicked(self) -> None:
+        value = self.window.control_panel.model_name()
+        if not value:
+            self._show_error("모델명 적용", "모델명을 입력하세요.")
+            return
+
+        self._enqueue_control_for_targets(
+            handler="set_model_name",
+            kwargs={"value": value},
+            action_name="모델명 적용",
+        )
+
+    def _on_extra_id_apply_clicked(self) -> None:
+        value = self.window.control_panel.extra_id()
+        if not value:
+            self._show_error("Extra ID 적용", "Extra ID를 입력하세요.")
+            return
+
+        self._enqueue_control_for_targets(
+            handler="set_extra_id",
+            kwargs={"value": value},
+            action_name="Extra ID 적용",
+        )
 
     def _on_sync_rtc_clicked(self) -> None:
-        target_ips = self._current_target_ips()
-        if not target_ips:
-            self._show_error("Sync RTC", "체크되었거나 선택된 장비가 없습니다.")
+        self._enqueue_control_for_targets(
+            handler="set_rtc",
+            kwargs={},
+            action_name="시간 현재값 적용",
+        )
+
+    def _on_secondary_video_clicked(self) -> None:
+        self._enqueue_control_for_targets(
+            handler="apply_secondary_video",
+            kwargs={},
+            action_name="보조 영상 설정",
+        )
+
+    def _on_video_input_apply_clicked(self) -> None:
+        code = self.window.control_panel.video_input_code()
+        label = self.window.control_panel.video_input_label()
+        resolution_code = self.window.control_panel.video_input_max_resolution()
+
+        if not code:
+            self._show_error("입력 형식 적용", "입력 형식을 선택하세요.")
             return
 
-        for ip in target_ips:
-            self.supervisor.enqueue_control(ip, handler="set_rtc", kwargs={})
-            self._append_log(f"sync rtc queued: {ip}")
+        if not resolution_code:
+            self._show_error("입력 형식 적용", "선택한 입력 형식의 해상도 매핑을 찾을 수 없습니다.")
+            return
+
+        self._enqueue_control_for_targets(
+            handler="set_video_input_format",
+            kwargs={
+                "input_code": code,
+                "resolution_code": resolution_code,
+            },
+            action_name="입력 형식 적용",
+        )
+        self._append_log(
+            f"video input selected: {label} / VID_INPUTFORMAT={code} / VID_RESOLUTION={resolution_code}"
+        )
+
+    def _on_min_focus_apply_clicked(self) -> None:
+        value = self.window.control_panel.min_focus_value()
+        if not value:
+            self._show_error("최소 초점 적용", "최소 초점 거리를 입력하세요.")
+            return
+
+        self._enqueue_control_for_targets(
+            handler="set_min_focus_length",
+            kwargs={"value": value},
+            action_name="최소 초점 적용",
+        )
+
+    def _on_sensor_485_clicked(self, action: str) -> None:
+        self._enqueue_control_for_targets(
+            handler="set_sensor_485",
+            kwargs={"action": action},
+            action_name="485 Sensor 변경",
+        )
+
+    def _on_shock_sensor_clicked(self, action: str) -> None:
+        self._enqueue_control_for_targets(
+            handler="set_shock_sensor",
+            kwargs={"action": action},
+            action_name="Shock Sensor 변경",
+        )
+
+    def _on_audio_apply_clicked(self) -> None:
+        self._enqueue_control_for_targets(
+            handler="apply_audio_profile",
+            kwargs={
+                "algorithm": self.window.control_panel.audio_algorithm(),
+                "source": self.window.control_panel.audio_source(),
+                "output": self.window.control_panel.audio_output(),
+                "mode": "3",
+                "set_max_volume": False,
+            },
+            action_name="오디오 적용",
+        )
+
+    def _on_audio_max_volume_clicked(self) -> None:
+        self._enqueue_control_for_targets(
+            handler="apply_audio_profile",
+            kwargs={
+                "algorithm": self.window.control_panel.audio_algorithm(),
+                "source": self.window.control_panel.audio_source(),
+                "output": self.window.control_panel.audio_output(),
+                "mode": "3",
+                "set_max_volume": True,
+            },
+            action_name="오디오 최대 볼륨",
+        )
+
+    def _on_reboot_clicked(self) -> None:
+        mode = self.window.control_panel.control_mode()
+        target_label = "현재 장비" if mode == "single" else "체크한 장비"
+        self._enqueue_control_for_targets(
+            handler="reboot",
+            kwargs={},
+            action_name="재부팅",
+            confirm_text=f"{target_label}를 재부팅하시겠습니까?",
+        )
+
+    def _on_factory_reset_clicked(self) -> None:
+        mode = self.window.control_panel.control_mode()
+        target_label = "현재 장비" if mode == "single" else "체크한 장비"
+        self._enqueue_control_for_targets(
+            handler="factory_reset",
+            kwargs={},
+            action_name="공장 초기화",
+            confirm_text=f"{target_label}를 공장 초기화하시겠습니까?",
+        )
 
     def _on_table_selection_changed(self, selected, deselected) -> None:
         self._sync_registry_selection_from_table()

@@ -73,3 +73,12 @@ class DeviceSession:
             "timeout_sec": timeout_sec,
             "verify_tls": verify_tls,
         }
+
+    def close(self) -> None:
+        session = self.shared_session
+        if session is None:
+            return
+        try:
+            session.close()
+        except Exception:
+            pass
