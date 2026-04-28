@@ -1,19 +1,21 @@
 from __future__ import annotations
 
+import ipaddress
 import time
 from dataclasses import dataclass
+from typing import Callable
 
 from infra.discovery.network import (
-    compute_directed_broadcast,
+    build_broadcast_destinations,
     get_local_ipv4,
     open_udp_socket,
     safe_close_socket,
+    send_udp_many,
 )
 from infra.discovery.packet_parser import REQ24, ParsedDiscoveryPacket, parse_discovery_packet
 
 
 DEFAULT_PORT = 64988
-LIMITED_BCAST = "255.255.255.255"
 
 
 @dataclass(frozen=True)
@@ -27,22 +29,14 @@ class UdpDiscoveryDevice:
     note: str
 
 
-def _build_destinations(bind_ip: str | None, mask_bits: int, port: int) -> list[tuple[str, int]]:
-    dsts: list[tuple[str, int]] = [(LIMITED_BCAST, port)]
-
-    if bind_ip:
+def _sort_devices(devices: list[UdpDiscoveryDevice]) -> list[UdpDiscoveryDevice]:
+    def sort_key(item: UdpDiscoveryDevice):
         try:
-            dsts.append((compute_directed_broadcast(bind_ip, mask_bits), port))
+            return (0, int(ipaddress.ip_address(item.ip)))
         except Exception:
-            pass
+            return (1, item.ip)
 
-    uniq: list[tuple[str, int]] = []
-    seen = set()
-    for d in dsts:
-        if d not in seen:
-            uniq.append(d)
-            seen.add(d)
-    return uniq
+    return sorted(devices, key=sort_key)
 
 
 def run_udp_discovery(
@@ -54,24 +48,43 @@ def run_udp_discovery(
     repeat: int = 4,
     interval: float = 0.12,
     ignore_self: bool = True,
+    min_wait: float = 0.25,
+    quiet_exit: float = 0.18,
+    stop_requested: Callable[[], bool] | None = None,
 ) -> tuple[str | None, list[UdpDiscoveryDevice]]:
     bind_ip = bind_ip or get_local_ipv4()
+    destinations = build_broadcast_destinations(bind_ip=bind_ip, mask_bits=mask_bits, port=port)
     sock = open_udp_socket("0.0.0.0", port, timeout=0.05)
 
-    found: dict[str, UdpDiscoveryDevice] = {}
-    dsts = _build_destinations(bind_ip, mask_bits, port)
+    found_by_mac: dict[str, UdpDiscoveryDevice] = {}
+    found_by_ip: dict[str, str] = {}
+
+    started_at = time.time()
+    deadline = started_at + max(0.5, float(seconds))
+    last_packet_at: float | None = None
 
     try:
-        deadline = time.time() + max(0.5, float(seconds))
-
         while time.time() < deadline:
-            for _ in range(max(1, int(repeat))):
-                for dst in dsts:
-                    sock.sendto(REQ24, dst)
-                time.sleep(max(0.01, float(interval)))
+            if stop_requested and stop_requested():
+                break
 
-            rx_end = time.time() + max(0.2, float(interval) * 3.0)
+            send_udp_many(
+                sock,
+                payload=REQ24,
+                destinations=destinations,
+                repeat=max(1, int(repeat)),
+                gap_sec=max(0.01, float(interval)),
+                stop_requested=stop_requested,
+            )
+
+            if stop_requested and stop_requested():
+                break
+
+            rx_end = time.time() + max(0.20, float(interval) * 3.0)
             while time.time() < rx_end:
+                if stop_requested and stop_requested():
+                    break
+
                 try:
                     pkt, (src_ip, src_port) = sock.recvfrom(4096)
                 except TimeoutError:
@@ -81,14 +94,22 @@ def run_udp_discovery(
 
                 if src_port != port:
                     continue
+
                 if ignore_self and bind_ip and src_ip == bind_ip:
                     continue
 
-                parsed = parse_discovery_packet(pkt, src_ip)
+                parsed: ParsedDiscoveryPacket | None = parse_discovery_packet(pkt, src_ip)
                 if parsed is None:
                     continue
 
-                found[parsed.mac12] = UdpDiscoveryDevice(
+                last_packet_at = time.time()
+
+                existing_mac = found_by_ip.get(parsed.ip)
+                if existing_mac and existing_mac != parsed.mac12:
+                    # 같은 IP에서 MAC이 바뀌는 이상 케이스는 새 응답을 우선 반영
+                    found_by_mac.pop(existing_mac, None)
+
+                device = UdpDiscoveryDevice(
                     ip=parsed.ip,
                     mac=parsed.mac,
                     mac12=parsed.mac12,
@@ -97,10 +118,16 @@ def run_udp_discovery(
                     lens=parsed.lens or "-",
                     note=parsed.note or "-",
                 )
+                found_by_mac[device.mac12] = device
+                found_by_ip[device.ip] = device.mac12
+
+            elapsed = time.time() - started_at
+            if elapsed >= max(0.0, float(min_wait)) and found_by_mac:
+                if last_packet_at is not None and (time.time() - last_packet_at) >= max(0.0, float(quiet_exit)):
+                    break
 
             time.sleep(0.02)
 
-        return bind_ip, list(found.values())
-
+        return bind_ip, _sort_devices(list(found_by_mac.values()))
     finally:
         safe_close_socket(sock)

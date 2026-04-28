@@ -26,6 +26,16 @@ class ParsedDiscoveryPacket:
     note: str | None = None
 
 
+def normalize_mac12(mac: str) -> str:
+    raw = (mac or "").strip()
+    if raw.lower().startswith("0x"):
+        raw = raw[2:]
+    raw = re.sub(r"[^0-9a-fA-F]", "", raw)
+    if len(raw) != 12:
+        raise ValueError(f"invalid mac12: {mac}")
+    return raw.upper()
+
+
 def mac6_to_str(mac6: bytes) -> str:
     return ":".join(f"{b:02X}" for b in mac6)
 
@@ -45,6 +55,10 @@ def is_discovery_response(pkt: bytes) -> bool:
 
 
 def extract_mac_by_marker(pkt: bytes) -> Optional[tuple[int, bytes, str]]:
+    """
+    marker 뒤 MAC offset이 1바이트 정도 흔들리는 패킷 편차를 허용한다.
+    TRUEN OUI가 보이면 우선 사용하고, 아니면 가장 먼저 잡힌 후보를 사용한다.
+    """
     best: Optional[tuple[int, bytes, str]] = None
 
     for marker in MAC_MARKERS:
@@ -54,13 +68,17 @@ def extract_mac_by_marker(pkt: bytes) -> Optional[tuple[int, bytes, str]]:
             if idx == -1:
                 break
 
-            cand_offs = [idx + len(marker) - 1, idx + len(marker), idx + len(marker) + 1]
+            candidate_offsets = [
+                idx + len(marker) - 1,
+                idx + len(marker),
+                idx + len(marker) + 1,
+            ]
 
-            for mac_off in cand_offs:
+            for mac_off in candidate_offsets:
                 if mac_off < 0 or mac_off + 6 > len(pkt):
                     continue
 
-                mac6 = pkt[mac_off:mac_off + 6]
+                mac6 = pkt[mac_off : mac_off + 6]
                 if not is_probable_unicast_mac(mac6):
                     continue
 
@@ -77,37 +95,51 @@ def extract_mac_by_marker(pkt: bytes) -> Optional[tuple[int, bytes, str]]:
     return best
 
 
-def extract_model_fw_after_mac(pkt: bytes, mac_off: int | None) -> tuple[str | None, str | None]:
-    if mac_off is None:
-        return None, None
-
-    start = mac_off + 6
-    search = pkt[start:start + 96]
-
+def _ascii_runs(blob: bytes, *, min_len: int = 4) -> list[str]:
     runs: list[str] = []
     buf = bytearray()
 
     def flush() -> None:
         nonlocal buf
-        if len(buf) >= 4:
+        if len(buf) >= min_len:
             try:
-                runs.append(buf.decode("ascii"))
+                text = buf.decode("ascii", errors="ignore").strip()
+                if text:
+                    runs.append(text)
             except Exception:
                 pass
         buf = bytearray()
 
-    for b in search:
-        if 0x20 <= b <= 0x7E:
-            buf.append(b)
+    for value in blob:
+        if 0x20 <= value <= 0x7E:
+            buf.append(value)
         else:
             flush()
     flush()
+    return runs
+
+
+def _clean_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = " ".join(str(value).split()).strip().strip("\x00")
+    return text or None
+
+
+def extract_model_fw_after_mac(pkt: bytes, mac_off: int | None) -> tuple[str | None, str | None]:
+    if mac_off is None:
+        return None, None
+
+    start = mac_off + 6
+    search = pkt[start : start + 128]
+    runs = [_clean_text(x) for x in _ascii_runs(search, min_len=4)]
+    runs = [x for x in runs if x]
 
     if not runs:
         return None, None
 
     model = runs[0]
-    fw = runs[1] if len(runs) >= 2 else None
+    firmware = runs[1] if len(runs) >= 2 else None
 
     def looks_fw(s: str) -> bool:
         return bool(re.match(r"^[Vv]\d", s)) or ("." in s and any(c.isdigit() for c in s))
@@ -115,22 +147,22 @@ def extract_model_fw_after_mac(pkt: bytes, mac_off: int | None) -> tuple[str | N
     def looks_model(s: str) -> bool:
         return ("-" in s and len(s) >= 6) or bool(re.match(r"^[A-Za-z]{1,4}[A-Za-z0-9\-]{4,}$", s))
 
-    if fw and looks_model(fw) and looks_fw(model):
-        model, fw = fw, model
+    if firmware and looks_model(firmware) and looks_fw(model):
+        model, firmware = firmware, model
 
-    if not looks_model(model):
-        for s in runs:
-            if looks_model(s):
-                model = s
+    if model and not looks_model(model):
+        for item in runs:
+            if looks_model(item):
+                model = item
                 break
 
-    if fw and not looks_fw(fw):
-        for s in runs:
-            if s != model and looks_fw(s):
-                fw = s
+    if firmware and not looks_fw(firmware):
+        for item in runs:
+            if item != model and looks_fw(item):
+                firmware = item
                 break
 
-    return model, fw
+    return _clean_text(model), _clean_text(firmware)
 
 
 def parse_discovery_packet(pkt: bytes, src_ip: str) -> ParsedDiscoveryPacket | None:
@@ -142,17 +174,14 @@ def parse_discovery_packet(pkt: bytes, src_ip: str) -> ParsedDiscoveryPacket | N
         return None
 
     mac_off, mac6, mac_note = mac_found
-    mac = mac6_to_str(mac6)
-    mac12 = mac6.hex().upper().zfill(12)
     model, firmware = extract_model_fw_after_mac(pkt, mac_off)
-    lens = str(len(pkt))
 
     return ParsedDiscoveryPacket(
         ip=src_ip,
-        mac=mac,
-        mac12=mac12,
-        model=model,
-        firmware=firmware,
-        lens=lens,
-        note=mac_note,
+        mac=mac6_to_str(mac6),
+        mac12=mac6.hex().upper().zfill(12),
+        model=model or "-",
+        firmware=firmware or "-",
+        lens=str(len(pkt)),
+        note=mac_note or "-",
     )
