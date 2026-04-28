@@ -1,0 +1,145 @@
+================================================================================
+FOLDER: common/display
+FILE COUNT: 2
+================================================================================
+
+FILES:
+- display_names.py
+- enum_formatters.py
+
+
+################################################################################
+FILE: display_names.py
+PATH: common/display/display_names.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+
+DISPLAY_NAME_MAP: dict[str, str] = {
+    "NET_RTSPPORT": "RTSP Port",
+    "NET_MAC": "MAC Address",
+    "NET_LOCALIPMODE": "Local IP Mode",
+    "NET_EXTRA_ID": "Extra ID",
+    "SYS_VERSION": "Firmware",
+    "SYS_MODELNAME": "Model",
+    "SYS_MODELNAME_ID": "Model",
+    "SYS_MODE": "Type",
+    "SYS_BOARDID": "Board ID",
+    "SYS_MODULE_TYPE": "Module Type",
+    "SYS_MODULE_DETAIL": "Module Detail",
+    "SYS_PTZ_TYPE": "PTZ Type",
+    "SYS_ZOOMMODULE": "Zoom Module",
+    "SYS_PRODUCT_MODEL": "Product Model",
+    "SYS_AI_VERSION": "AI Version",
+    "SYS_RCV_VERSION": "RCV Version",
+    "SYS_CURRENTTIME": "RTC",
+    "SYS_STARTTIME": "Start Up Time",
+    "SYS_BOARDTEMP": "Temp",
+    "SYS_FANSTATUS": "Fan",
+    "CAM_READMODULEVERSION": "Module Version",
+    "CAM_READMECAVERSION": "PTZ F/W",
+    "TEST_Power_CheckString": "Power Type",
+    "CDS": "CDS",
+    "CURRENT_Y": "Current Y",
+    "RATE1": "Rate1",
+    "RATE2": "Rate2",
+    "RATE3": "Rate3",
+    "RATE4": "Rate4",
+    "RTC": "RTC",
+    "ETHERNET": "Ethernet",
+    "TEMP": "Temp",
+    "FAN": "Fan",
+    "ETHTOOL": "Ethernet Detail",
+    "GIS_SENSOR1": "Sensor1",
+    "GIS_SENSOR2": "Sensor2",
+    "GIS_SENSOR3": "Sensor3",
+    "GIS_SENSOR4": "Sensor4",
+    "GIS_SENSOR5": "Sensor5",
+    "GIS_MOTION1": "Motion1",
+    "GIS_MOTION2": "Motion2",
+    "GIS_MOTION3": "Motion3",
+    "GIS_MOTION4": "Motion4",
+    "GIS_VIDEOLOSS1": "VideoLoss1",
+    "GIS_VIDEOLOSS2": "VideoLoss2",
+    "GIS_VIDEOLOSS3": "VideoLoss3",
+    "GIS_VIDEOLOSS4": "VideoLoss4",
+    "GIS_ALARM1": "Alarm1",
+    "GIS_ALARM2": "Alarm2",
+    "GIS_ALARM3": "Alarm3",
+    "GIS_ALARM4": "Alarm4",
+    "GIS_RECORD1": "Record1",
+    "GIS_AIRWIPER": "AirWiper",
+    "GRS_AENCBITRATE1": "Audio Enc Bitrate",
+    "GRS_ADECBITRATE1": "Audio Dec Bitrate",
+    "GRS_ADECALGORITHM1": "Audio Dec Algorithm",
+    "GRS_ADECSAMPLERATE1": "Audio Dec Samplerate",
+}
+
+
+def _prettify_fallback(key: str) -> str:
+    value = (key or "").strip()
+    if not value:
+        return "-"
+    value = value.replace("_", " ").replace("-", " ").strip()
+    parts = [p for p in value.split() if p]
+    return " ".join(p.capitalize() for p in parts) if parts else "-"
+
+
+def display_name(key: str) -> str:
+    normalized = (key or "").strip()
+    if not normalized:
+        return "-"
+    return DISPLAY_NAME_MAP.get(normalized, _prettify_fallback(normalized))
+
+################################################################################
+FILE: enum_formatters.py
+PATH: common/display/enum_formatters.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+
+_SYS_MODE_MAP = {
+    "0": "Encoder",
+    "1": "Decoder",
+    "2": "Duplex",
+}
+
+_NET_LOCALIPMODE_MAP = {
+    "0": "Fixed IP",
+    "1": "DHCP",
+}
+
+
+def format_sys_mode(value: object | None) -> str:
+    if value is None:
+        return "-"
+    text = str(value).strip()
+    return _SYS_MODE_MAP.get(text, text or "-")
+
+
+def format_local_ip_mode(value: object | None) -> str:
+    if value is None:
+        return "-"
+    text = str(value).strip()
+    return _NET_LOCALIPMODE_MAP.get(text, text or "-")
+
+
+def format_display_value(key: str, value: object | None) -> str:
+    normalized_key = (key or "").strip().upper()
+
+    if value is None:
+        return "-"
+
+    if normalized_key == "SYS_MODE":
+        return format_sys_mode(value)
+
+    if normalized_key == "NET_LOCALIPMODE":
+        return format_local_ip_mode(value)
+
+    text = str(value).strip()
+    return text if text else "-"
+

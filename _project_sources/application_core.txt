@@ -1,0 +1,1264 @@
+================================================================================
+FOLDER: application/core
+FILE COUNT: 8
+================================================================================
+
+FILES:
+- app_supervisor.py
+- command_factory.py
+- device_actor.py
+- device_registry.py
+- device_session.py
+- poll_coordinator.py
+- task_scheduler.py
+- ui_update_bus.py
+
+
+################################################################################
+FILE: app_supervisor.py
+PATH: application/core/app_supervisor.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+import logging
+import threading
+import time
+
+from application.core.command_factory import CommandFactory
+from application.core.device_actor import DeviceActor
+from application.core.device_registry import DeviceRegistry
+from application.core.poll_coordinator import PollCoordinator
+from application.core.task_scheduler import TaskScheduler
+from application.core.ui_update_bus import UiUpdateBatch, UiUpdateBus
+from application.services.connect_service import CameraConnectService
+from config.app_settings import AppSettings
+from config.ui_settings import UiSettings
+from domain.enums.app_mode import AppMode
+from domain.models.app_snapshot import AppSnapshot
+from domain.models.phase1 import Phase1Request
+from infra.device.control_repository import ControlRepository
+from infra.device.info_repository import InfoRepository
+from infra.device.status_repository import StatusRepository
+
+log = logging.getLogger(__name__)
+
+
+class AppSupervisor:
+    def __init__(
+        self,
+        *,
+        settings: AppSettings | None = None,
+        ui_settings: UiSettings | None = None,
+        connect_service: CameraConnectService | None = None,
+        info_repository: InfoRepository | None = None,
+        status_repository: StatusRepository | None = None,
+        control_repository: ControlRepository | None = None,
+    ) -> None:
+        self.settings = settings or AppSettings.load()
+        self.ui_settings = ui_settings or UiSettings.load()
+
+        self.registry = DeviceRegistry()
+        self.ui_update_bus = UiUpdateBus()
+        self.poll_coordinator = PollCoordinator(page_size=self.ui_settings.device_page_size)
+
+        self.connect_service = connect_service or CameraConnectService(settings=self.settings)
+        self.info_repository = info_repository or InfoRepository()
+        self.status_repository = status_repository or StatusRepository()
+        self.control_repository = control_repository or ControlRepository()
+
+        self.scheduler = TaskScheduler(registry=self.registry)
+
+        self._stop_event = threading.Event()
+        self._wake_event = threading.Event()
+        self._scheduler_thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._scheduler_thread is not None and self._scheduler_thread.is_alive():
+            return
+
+        self._stop_event.clear()
+        self._wake_event.clear()
+        self._scheduler_thread = threading.Thread(
+            target=self._scheduler_loop,
+            name="TaskSchedulerThread",
+            daemon=True,
+        )
+        self._scheduler_thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._wake_event.set()
+
+        thread = self._scheduler_thread
+        self._scheduler_thread = None
+
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+
+    def wake_scheduler(self) -> None:
+        self._wake_event.set()
+
+    def _scheduler_loop(self) -> None:
+        while not self._stop_event.is_set():
+            progressed = False
+
+            try:
+                progressed = self.scheduler.dispatch_once()
+            except Exception:
+                log.exception("scheduler dispatch failed")
+
+            if progressed:
+                continue
+
+            self._wake_event.wait(timeout=0.05)
+            self._wake_event.clear()
+
+    def add_device(self, ip: str, *, port: int = 0, note: str = "") -> None:
+        self.registry.ensure_device(ip, port=port, note=note)
+        actor = self.registry.get_actor(ip)
+        if actor is None:
+            actor = DeviceActor(
+                ip=ip,
+                registry=self.registry,
+                ui_update_bus=self.ui_update_bus,
+                connect_service=self.connect_service,
+                info_repository=self.info_repository,
+                status_repository=self.status_repository,
+                control_repository=self.control_repository,
+                verify_tls=self.settings.verify_tls,
+                default_timeout_sec=self.settings.timeout.read_sec,
+            )
+            self.registry.attach_actor(ip, actor)
+
+        self.ui_update_bus.mark_device_dirty(ip)
+        self.ui_update_bus.mark_app_dirty("devices")
+
+    def add_devices(self, ips: list[str]) -> None:
+        for ip in ips:
+            self.add_device(ip)
+
+    def set_selected(self, ip: str, selected: bool) -> None:
+        self.registry.set_selected(ip, selected)
+        self.ui_update_bus.mark_device_dirty(ip)
+        self.ui_update_bus.mark_app_dirty("selection")
+
+    def set_focused(self, ip: str | None) -> None:
+        old_focused = self.registry.focused_ip
+        self.registry.set_focused(ip)
+        if old_focused:
+            self.ui_update_bus.mark_device_dirty(old_focused)
+        if ip:
+            self.ui_update_bus.mark_device_dirty(ip)
+        self.ui_update_bus.mark_app_dirty("focus")
+
+    def set_current_video_page(self, page_index: int) -> None:
+        self.poll_coordinator.set_current_page(page_index)
+        poll_sets = self.poll_coordinator.compute_sets(self.registry)
+        self.ui_update_bus.mark_devices_dirty(list(poll_sets.hot_ips))
+        self.ui_update_bus.mark_app_dirty("video_page")
+
+    def enqueue_connect(self, device_ip: str, request: Phase1Request) -> None:
+        task = CommandFactory.connect(device_ip, request)
+        self.scheduler.enqueue(task)
+        self.ui_update_bus.mark_device_dirty(device_ip)
+        self.wake_scheduler()
+
+    def enqueue_info_load(self, device_ip: str) -> None:
+        task = CommandFactory.info_load(device_ip)
+        self.scheduler.enqueue(task)
+        self.ui_update_bus.mark_device_dirty(device_ip)
+        self.wake_scheduler()
+
+    def enqueue_status_poll(self, device_ip: str, *, hot: bool) -> None:
+        task = CommandFactory.status_poll(device_ip, hot=hot)
+        self.scheduler.enqueue(task)
+        self.ui_update_bus.mark_device_dirty(device_ip)
+        self.wake_scheduler()
+
+    def enqueue_control(self, device_ip: str, *, handler: str, kwargs: dict | None = None) -> None:
+        task = CommandFactory.control(device_ip, handler=handler, kwargs=kwargs)
+        self.scheduler.enqueue(task)
+        self.ui_update_bus.mark_device_dirty(device_ip)
+        self.wake_scheduler()
+
+    def enqueue_hot_polls_for_visible_page(self) -> None:
+        poll_sets = self.poll_coordinator.compute_sets(self.registry)
+        for ip in poll_sets.hot_ips:
+            self.enqueue_status_poll(ip, hot=True)
+        for ip in poll_sets.warm_ips:
+            self.enqueue_status_poll(ip, hot=False)
+
+    def flush_ui_updates(self) -> UiUpdateBatch:
+        return self.ui_update_bus.flush()
+
+    def get_snapshot(self, ip: str):
+        return self.registry.get_snapshot(ip)
+
+    def get_app_snapshot(self) -> AppSnapshot:
+        visible = self.poll_coordinator.visible_page_ips()
+        return self.registry.build_app_snapshot(
+            current_video_page=self.poll_coordinator.current_page,
+            video_page_size=self.poll_coordinator.page_size,
+            visible_video_ips=visible,
+            app_mode=AppMode.NORMAL,
+            firmware_window_open=False,
+            video_window_open=False,
+        )
+
+################################################################################
+FILE: command_factory.py
+PATH: application/core/command_factory.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+import time
+import uuid
+
+from domain.enums.command import CommandKind, TaskLane
+from domain.models.phase1 import Phase1Request
+from domain.models.tasks import TaskSpec
+
+
+def _task_id(prefix: str) -> str:
+    return f"{prefix}-{uuid.uuid4().hex[:12]}"
+
+
+class CommandFactory:
+    @staticmethod
+    def connect(device_ip: str, request: Phase1Request, *, priority: int = 50) -> TaskSpec:
+        return TaskSpec(
+            task_id=_task_id("connect"),
+            device_ip=device_ip,
+            command=CommandKind.CONNECT,
+            lane=TaskLane.CONNECT,
+            priority=priority,
+            payload={"request": request},
+            created_at=time.time(),
+        )
+
+    @staticmethod
+    def info_load(device_ip: str, *, priority: int = 40) -> TaskSpec:
+        return TaskSpec(
+            task_id=_task_id("info"),
+            device_ip=device_ip,
+            command=CommandKind.INFO_LOAD,
+            lane=TaskLane.INFO,
+            priority=priority,
+            payload={},
+            created_at=time.time(),
+        )
+
+    @staticmethod
+    def status_poll(device_ip: str, *, hot: bool, priority: int | None = None) -> TaskSpec:
+        lane = TaskLane.POLL_HOT if hot else TaskLane.POLL_WARM
+        default_priority = 20 if hot else 10
+        return TaskSpec(
+            task_id=_task_id("poll"),
+            device_ip=device_ip,
+            command=CommandKind.STATUS_POLL,
+            lane=lane,
+            priority=priority if priority is not None else default_priority,
+            payload={"hot": hot},
+            created_at=time.time(),
+        )
+
+    @staticmethod
+    def control(
+        device_ip: str,
+        *,
+        handler: str,
+        kwargs: dict | None = None,
+        priority: int = 100,
+    ) -> TaskSpec:
+        return TaskSpec(
+            task_id=_task_id("control"),
+            device_ip=device_ip,
+            command=CommandKind.CONTROL,
+            lane=TaskLane.CONTROL,
+            priority=priority,
+            payload={"handler": handler, "kwargs": dict(kwargs or {})},
+            created_at=time.time(),
+        )
+
+################################################################################
+FILE: device_actor.py
+PATH: application/core/device_actor.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+import time
+import re
+from dataclasses import replace
+from typing import Any, Callable
+
+from application.core.device_session import DeviceSession
+from application.core.device_registry import DeviceRegistry
+from application.core.ui_update_bus import UiUpdateBus
+from application.services.connect_service import CameraConnectService
+from common.display.enum_formatters import format_display_value
+from domain.enums.command import CommandKind
+from domain.enums.device import DeviceState
+from domain.errors.app_error import AppError
+from domain.models.phase1 import Phase1Request, Phase1Response
+from domain.models.tasks import TaskSpec
+from infra.device.control_repository import ControlRepository
+from infra.device.info_repository import InfoRepository, build_disk_text
+from infra.device.status_repository import StatusRepository
+
+
+class DeviceActor:
+    def __init__(
+        self,
+        *,
+        ip: str,
+        registry: DeviceRegistry,
+        ui_update_bus: UiUpdateBus,
+        connect_service: CameraConnectService,
+        info_repository: InfoRepository,
+        status_repository: StatusRepository,
+        control_repository: ControlRepository,
+        verify_tls: bool = False,
+        default_timeout_sec: float = 6.0,
+    ) -> None:
+        self.ip = ip
+        self.registry = registry
+        self.ui_update_bus = ui_update_bus
+
+        self.connect_service = connect_service
+        self.info_repository = info_repository
+        self.status_repository = status_repository
+        self.control_repository = control_repository
+
+        self.verify_tls = bool(verify_tls)
+        self.default_timeout_sec = float(default_timeout_sec)
+
+        self.session: DeviceSession | None = None
+        self.current_task_id: str | None = None
+        self.current_task_kind: str | None = None
+        self.pending_count: int = 0
+
+    def is_busy(self) -> bool:
+        return self.current_task_id is not None
+
+    def can_accept_task(self, task: TaskSpec) -> bool:
+        return not self.is_busy()
+
+    def begin_task(self, task: TaskSpec) -> None:
+        if self.is_busy():
+            raise AppError(kind="busy", message="device actor already busy", detail=self.ip)
+
+        self.current_task_id = task.task_id
+        self.current_task_kind = task.command.value
+
+        snapshot = self.registry.require_snapshot(self.ip)
+        updated = replace(
+            snapshot,
+            command=replace(
+                snapshot.command,
+                current_task_id=task.task_id,
+                current_task_kind=task.command.value,
+                inflight=True,
+                queued_count=max(0, self.pending_count),
+                progress_text=task.command.value,
+            ),
+        )
+        self.registry.upsert_snapshot(updated)
+        self.ui_update_bus.mark_device_dirty(self.ip)
+
+    def finish_task(
+        self,
+        *,
+        message: str = "",
+        error: AppError | None = None,
+    ) -> None:
+        snapshot = self.registry.require_snapshot(self.ip)
+
+        # Step 4 최종 수정 반영:
+        # generic message가 control-specific message를 덮어쓰지 않도록 기존 last_message 유지
+        keep_message = snapshot.command.last_message
+        final_message = keep_message or message
+
+        updated = replace(
+            snapshot,
+            command=replace(
+                snapshot.command,
+                current_task_id=None,
+                current_task_kind=None,
+                inflight=False,
+                queued_count=max(0, self.pending_count),
+                last_result="ok" if error is None else "error",
+                last_message=final_message if error is None else keep_message,
+                last_error_kind=(error.kind if error else ""),
+                last_error_detail=(error.detail or error.message if error else ""),
+                progress_text="",
+            ),
+        )
+        self.registry.upsert_snapshot(updated)
+        self.current_task_id = None
+        self.current_task_kind = None
+        self.ui_update_bus.mark_device_dirty(self.ip)
+
+    def execute_task(self, task: TaskSpec) -> None:
+        self.begin_task(task)
+        try:
+            if task.command == CommandKind.CONNECT:
+                self._handle_connect(task)
+                self.finish_task(message="connect completed")
+            elif task.command == CommandKind.INFO_LOAD:
+                self._handle_info_load(task)
+                self.finish_task(message="info_load completed")
+            elif task.command == CommandKind.STATUS_POLL:
+                self._handle_status_poll(task)
+                self.finish_task(message="status_poll completed")
+            elif task.command == CommandKind.CONTROL:
+                self._handle_control(task)
+                self.finish_task(message="")
+            else:
+                raise AppError(kind="param", message="unsupported task command", detail=task.command.value)
+
+        except AppError as exc:
+            self._apply_error_state(exc)
+            self.finish_task(message="", error=exc)
+            raise
+        except Exception as exc:
+            wrapped = AppError(kind="runtime", message="device task failed", detail=str(exc))
+            self._apply_error_state(wrapped)
+            self.finish_task(message="", error=wrapped)
+            raise wrapped from exc
+
+    def _apply_error_state(self, error: AppError) -> None:
+        snapshot = self.registry.require_snapshot(self.ip)
+        new_state = snapshot.state
+
+        if error.kind == "auth":
+            new_state = DeviceState.AUTH_FAILED
+        elif error.kind in ("timeout", "network", "http"):
+            new_state = DeviceState.DISCONNECTED
+
+        updated = replace(snapshot, state=new_state, connected=(new_state == DeviceState.READY))
+        self.registry.upsert_snapshot(updated)
+        self.ui_update_bus.mark_device_dirty(self.ip)
+
+    def _handle_connect(self, task: TaskSpec) -> None:
+        payload = dict(task.payload or {})
+        request = payload.get("request")
+        if not isinstance(request, Phase1Request):
+            raise AppError(kind="param", message="connect task missing Phase1Request")
+
+        response = self.connect_service.connect(request)
+        if not response.ok:
+            raise response.error or AppError(kind="auth", message="connect failed")
+
+        self.session = DeviceSession.from_phase1(response)
+
+        snapshot = self.registry.require_snapshot(self.ip)
+        updated = replace(
+            snapshot,
+            port=request.port,
+            state=DeviceState.READY,
+            connected=True,
+            info_loaded=False,
+            base_url=response.base_url or "",
+            root_path=response.root_path or "",
+            auth_scheme=response.auth_scheme or "",
+            flavor=self.session.flavor,
+            username=response.effective_username or "",
+            effective_password=response.effective_password or "",
+            default_password_state=response.default_password_state,
+            password_changed=response.password_changed,
+            sys_version=response.sys_version or snapshot.sys_version,
+            firmware=response.sys_version or snapshot.firmware,
+            last_success_at=time.time(),
+        )
+        self.registry.upsert_snapshot(updated)
+        self.ui_update_bus.mark_device_dirty(self.ip)
+
+    def _require_session(self) -> DeviceSession:
+        if self.session is None:
+            snapshot = self.registry.require_snapshot(self.ip)
+            if snapshot.base_url and snapshot.root_path and snapshot.auth_scheme:
+                response = Phase1Response(
+                    ok=True,
+                    base_url=snapshot.base_url,
+                    root_path=snapshot.root_path,
+                    auth_scheme=snapshot.auth_scheme,
+                    flavor=snapshot.flavor.value,
+                    effective_username=snapshot.username,
+                    effective_password=snapshot.effective_password,
+                    sys_version=snapshot.sys_version,
+                )
+                self.session = DeviceSession.from_phase1(response)
+            else:
+                raise AppError(kind="state", message="device session is not established", detail=self.ip)
+        return self.session
+
+    def _handle_info_load(self, task: TaskSpec) -> None:
+        session = self._require_session()
+        client = self.info_repository.build_client(
+            **session.as_client_kwargs(
+                timeout_sec=self.default_timeout_sec,
+                verify_tls=self.verify_tls,
+            )
+        )
+        result = self.info_repository.read_info_kv(client)
+        kv = result.merged_kv
+
+        snapshot = self.registry.require_snapshot(self.ip)
+
+        updated = replace(
+            snapshot,
+            state=DeviceState.READY,
+            connected=True,
+            info_loaded=True,
+            mac=(kv.get("NET_MAC") or snapshot.mac).strip(),
+            model=(kv.get("SYS_MODELNAME_ID") or kv.get("SYS_MODELNAME") or snapshot.model).strip(),
+            firmware=(kv.get("SYS_VERSION") or snapshot.firmware).strip(),
+            sys_version=(kv.get("SYS_VERSION") or snapshot.sys_version).strip(),
+            board_id=(kv.get("SYS_BOARDID") or snapshot.board_id).strip(),
+            module_type=(kv.get("SYS_MODULE_TYPE") or snapshot.module_type).strip(),
+            module_detail=(kv.get("SYS_MODULE_DETAIL") or snapshot.module_detail).strip(),
+            ptz_type=(kv.get("SYS_PTZ_TYPE") or snapshot.ptz_type).strip(),
+            zoom_module=(kv.get("SYS_ZOOMMODULE") or snapshot.zoom_module).strip(),
+
+            sys_mode_text=format_display_value("SYS_MODE", kv.get("SYS_MODE")),
+            module_version=(kv.get("CAM_READMODULEVERSION") or snapshot.module_version).strip() or "-",
+            ptz_fw=(kv.get("CAM_READMECAVERSION") or snapshot.ptz_fw).strip() or "-",
+
+            # 기존 extra_id 대신 LD
+            linkdown_num=(kv.get("SYS_LINKDOWN_NUM") or snapshot.linkdown_num).strip() or "-",
+
+            local_ip_mode=format_display_value("NET_LOCALIPMODE", kv.get("NET_LOCALIPMODE")),
+            power_type=(kv.get("TEST_Power_CheckString") or snapshot.power_type).strip() or "-",
+            startup_time=(kv.get("SYS_STARTTIME") or snapshot.startup_time).strip() or "-",
+            disk_text=build_disk_text(kv),
+            ai_version=(kv.get("SYS_AI_VERSION") or snapshot.ai_version).strip() or "-",
+            rcv_version=(kv.get("SYS_RCV_VERSION") or snapshot.rcv_version).strip() or "-",
+
+            last_success_at=time.time(),
+        )
+        self.registry.upsert_snapshot(updated)
+        self.ui_update_bus.mark_device_dirty(self.ip)
+
+    def _handle_status_poll(self, task: TaskSpec) -> None:
+        session = self._require_session()
+        client = self.status_repository.build_client(
+            **session.as_client_kwargs(
+                timeout_sec=self.default_timeout_sec,
+                verify_tls=self.verify_tls,
+            )
+        )
+        result = self.status_repository.read_status_kv(client)
+        kv = result.merged_kv
+
+        def first(*keys: str) -> str:
+            for key in keys:
+                value = (kv.get(key) or "").strip()
+                if value:
+                    return value
+            return "-"
+
+        snapshot = self.registry.require_snapshot(self.ip)
+
+        metrics = replace(
+            snapshot.metrics,
+            rtc_text=first("SYS_CURRENTTIME"),
+            temp_text=first("SYS_BOARDTEMP", "SYS_BOARD_TEMP", "ETC_BOARDTEMP"),
+
+            # Ethernet: raw ETHTOOL 말고 사람이 읽는 값
+            eth_text=self._format_ethernet_text(kv),
+
+            rate1_text=self._build_rate_text(kv, 1),
+            rate2_text=self._build_rate_text(kv, 2),
+            rate3_text=self._build_rate_text(kv, 3),
+            rate4_text=self._build_rate_text(kv, 4),
+            audio_enc_bitrate=first("GRS_AENCBITRATE1"),
+            audio_dec_bitrate=first("GRS_ADECBITRATE1"),
+            audio_dec_algorithm=first("GRS_ADECALGORITHM1"),
+            audio_dec_samplerate=first("GRS_ADECSAMPLERATE1"),
+
+            # CDS 보정
+            cds_text=self._pick_cds_text(kv),
+
+            # Current Y는 "Current Value 81 CDS Value 0" 같은 raw에서 숫자만 추출
+            current_y_text=self._parse_current_y_value(
+                first("CAM_HI_CURRENT_Y", "CAM_NXP_CURRENT_Y", "CAM_AMBA_CURRENT_Y")
+            ),
+
+            fan_text=first("SYS_FANSTATUS", "SYS_FAN_STATUS", "FAN_STATUS"),
+            sensor_leds=self._tuple_leds(kv, "GIS_SENSOR"),
+            alarm_leds=self._tuple_leds(kv, "GIS_ALARM"),
+            updated_at=time.time(),
+        )
+
+        updated = replace(
+            snapshot,
+            state=DeviceState.READY,
+            connected=True,
+            metrics=metrics,
+            air_wiper=(kv.get("GIS_AIRWIPER") or snapshot.air_wiper).strip() or "-",
+
+            # Ethernet Speed Rate는 속도만 보관
+            ethernet_speed_rate=self._format_link_speed_from_ethtool(kv.get("ETHTOOL")),
+
+            last_success_at=time.time(),
+        )
+        self.registry.upsert_snapshot(updated)
+        self.ui_update_bus.mark_device_dirty(self.ip)
+
+    def _handle_control(self, task: TaskSpec) -> None:
+        session = self._require_session()
+        client = self.control_repository.build_client(
+            **session.as_client_kwargs(
+                timeout_sec=self.default_timeout_sec,
+                verify_tls=self.verify_tls,
+            )
+        )
+        payload = dict(task.payload or {})
+        handler_name = str(payload.get("handler") or "").strip()
+        kwargs = dict(payload.get("kwargs") or {})
+
+        if not handler_name:
+            raise AppError(kind="param", message="control task missing handler")
+
+        handler: Callable[..., Any] | None = getattr(self.control_repository, handler_name, None)
+        if handler is None:
+            raise AppError(kind="param", message="unknown control handler", detail=handler_name)
+
+        result = handler(client, **kwargs)
+
+        snapshot = self.registry.require_snapshot(self.ip)
+
+        # Step 4 최종 수정 반영:
+        # 실제 control 종류별 완료 메시지를 유지
+        completed_message = f"{handler_name} completed"
+
+        updated = replace(
+            snapshot,
+            command=replace(
+                snapshot.command,
+                last_result="ok",
+                last_message=completed_message,
+                last_error_kind="",
+                last_error_detail="",
+            ),
+            last_success_at=time.time(),
+        )
+        self.registry.upsert_snapshot(updated)
+        self.ui_update_bus.mark_device_dirty(self.ip)
+
+    def has_session(self) -> bool:
+        return self.session is not None
+
+    @staticmethod
+    def _tuple_leds(kv: dict[str, str], prefix: str) -> tuple[bool, bool, bool, bool]:
+        values: list[bool] = []
+        for idx in range(1, 5):
+            raw = (kv.get(f"{prefix}{idx}") or "").strip().lower()
+            values.append(raw in ("1", "on", "true", "yes"))
+        return tuple(values)  # type: ignore[return-value]
+
+    @staticmethod
+    def _build_rate_text(kv: dict[str, str], idx: int) -> str:
+        bitrate = (kv.get(f"GRS_VENCBITRATE{idx}") or "").strip()
+        fps = (kv.get(f"GRS_VENCFRAME{idx}") or "").strip()
+        if not bitrate and not fps:
+            return "-"
+        return f"{bitrate or '-'}kbps / {fps or '-'}fps"
+
+    @staticmethod
+    def _parse_current_y_value(text: str | None) -> str:
+        if not text:
+            return "-"
+
+        s = " ".join(str(text).split()).strip()
+        low = s.lower()
+
+        if low in {"unknown", "n/a", "na", "--", "-", "not support", "not supported", "unsupported"}:
+            return "-"
+
+        m = re.search(r"current\s+value\s+(-?\d+)", s, flags=re.IGNORECASE)
+        if m:
+            return m.group(1)
+
+        ints = re.findall(r"(-?\d+)", s)
+        if ints:
+            return ints[0]
+
+        return s or "-"
+
+    @staticmethod
+    def _format_link_speed_from_ethtool(code: str | None) -> str:
+        if code is None:
+            return "-"
+
+        v = str(code).strip()
+        if not v:
+            return "-"
+
+        if v == "24":
+            return "1G"
+        if v == "22":
+            return "100M"
+
+        return f"ETHTOOL({v})"
+
+    @classmethod
+    def _format_ethernet_text(cls, kv: dict[str, str]) -> str:
+        link_state = (
+                (kv.get("NET_LINKSTATE") or "")
+                or (kv.get("NET_LINK_STATE") or "")
+        ).strip().lower()
+
+        state_text = "link"
+        if link_state in {"0", "down", "off", "nolink"}:
+            state_text = "unlink"
+        elif link_state in {"1", "up", "on", "link"}:
+            state_text = "link"
+
+        speed_text = cls._format_link_speed_from_ethtool(kv.get("ETHTOOL"))
+        if speed_text == "-":
+            speed_text = (
+                                 (kv.get("NET_LINKSPEED") or "")
+                                 or (kv.get("NET_LINK_SPEED") or "")
+                                 or "-"
+                         ).strip() or "-"
+
+        if speed_text == "-":
+            return state_text
+
+        return f"{state_text} / {speed_text}"
+
+    @staticmethod
+    def _pick_cds_text(kv: dict[str, str]) -> str:
+        # as_test_tool 계열 우선순위: SYS_FTCAMERA_CDS -> GIS_CDS 계열
+        for key in ("SYS_FTCAMERA_CDS", "GIS_CDS", "GIS_CDS_CUR", "GIS_CDS_CURRENT"):
+            value = (kv.get(key) or "").strip()
+            if value:
+                return value
+        return "-"
+
+################################################################################
+FILE: device_registry.py
+PATH: application/core/device_registry.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+import threading
+from dataclasses import replace
+from typing import TYPE_CHECKING
+
+from domain.enums.app_mode import AppMode
+from domain.enums.device import DeviceState
+from domain.models.app_snapshot import AppSnapshot
+from domain.models.device_snapshot import DeviceSnapshot
+
+if TYPE_CHECKING:
+    from application.core.device_actor import DeviceActor
+
+
+class DeviceRegistry:
+    def __init__(self) -> None:
+        self.actors_by_ip: dict[str, DeviceActor] = {}
+        self.snapshots_by_ip: dict[str, DeviceSnapshot] = {}
+        self.ordered_ips: list[str] = []
+        self.selected_ips: set[str] = set()
+        self.focused_ip: str | None = None
+        self._lock = threading.RLock()
+
+    def has_device(self, ip: str) -> bool:
+        with self._lock:
+            return ip in self.snapshots_by_ip
+
+    def ensure_device(self, ip: str, *, port: int = 0, note: str = "") -> DeviceSnapshot:
+        with self._lock:
+            if ip in self.snapshots_by_ip:
+                return self.snapshots_by_ip[ip]
+
+            snapshot = DeviceSnapshot(
+                ip=ip,
+                port=port,
+                note=note,
+                state=DeviceState.DISCOVERED,
+                connected=False,
+                info_loaded=False,
+            )
+            self.snapshots_by_ip[ip] = snapshot
+            self.ordered_ips.append(ip)
+            return snapshot
+
+    def attach_actor(self, ip: str, actor: "DeviceActor") -> None:
+        with self._lock:
+            self.actors_by_ip[ip] = actor
+
+    def get_actor(self, ip: str) -> "DeviceActor | None":
+        with self._lock:
+            return self.actors_by_ip.get(ip)
+
+    def get_snapshot(self, ip: str) -> DeviceSnapshot | None:
+        with self._lock:
+            return self.snapshots_by_ip.get(ip)
+
+    def require_snapshot(self, ip: str) -> DeviceSnapshot:
+        with self._lock:
+            snapshot = self.snapshots_by_ip.get(ip)
+            if snapshot is None:
+                raise KeyError(f"device not found: {ip}")
+            return snapshot
+
+    def upsert_snapshot(self, snapshot: DeviceSnapshot) -> DeviceSnapshot:
+        with self._lock:
+            if snapshot.ip not in self.snapshots_by_ip:
+                self.ordered_ips.append(snapshot.ip)
+
+            self.snapshots_by_ip[snapshot.ip] = snapshot
+
+            if snapshot.selected:
+                self.selected_ips.add(snapshot.ip)
+            else:
+                self.selected_ips.discard(snapshot.ip)
+
+            if snapshot.focused:
+                self.focused_ip = snapshot.ip
+            elif self.focused_ip == snapshot.ip and not snapshot.focused:
+                self.focused_ip = None
+
+            return snapshot
+
+    def update_snapshot(self, ip: str, **changes) -> DeviceSnapshot:
+        with self._lock:
+            current = self.snapshots_by_ip.get(ip)
+            if current is None:
+                raise KeyError(f"device not found: {ip}")
+            updated = replace(current, **changes)
+            return self.upsert_snapshot(updated)
+
+    def set_selected(self, ip: str, selected: bool) -> DeviceSnapshot:
+        with self._lock:
+            snapshot = self.snapshots_by_ip.get(ip)
+            if snapshot is None:
+                raise KeyError(f"device not found: {ip}")
+            updated = replace(snapshot, selected=bool(selected))
+            return self.upsert_snapshot(updated)
+
+    def set_selected_many(self, ips: list[str], selected: bool) -> None:
+        for ip in ips:
+            if self.has_device(ip):
+                self.set_selected(ip, selected)
+
+    def clear_selection(self) -> None:
+        with self._lock:
+            ips = list(self.selected_ips)
+        for ip in ips:
+            self.set_selected(ip, False)
+
+    def set_focused(self, ip: str | None) -> None:
+        with self._lock:
+            current = self.focused_ip
+
+        if current and current != ip and self.has_device(current):
+            old_snapshot = self.require_snapshot(current)
+            self.upsert_snapshot(replace(old_snapshot, focused=False))
+
+        with self._lock:
+            self.focused_ip = None
+
+        if ip and self.has_device(ip):
+            snapshot = self.require_snapshot(ip)
+            self.upsert_snapshot(replace(snapshot, focused=True))
+            with self._lock:
+                self.focused_ip = ip
+
+    def list_snapshots(self) -> list[DeviceSnapshot]:
+        with self._lock:
+            ordered = list(self.ordered_ips)
+            snapshots = dict(self.snapshots_by_ip)
+        return [snapshots[ip] for ip in ordered if ip in snapshots]
+
+    def iter_connected_ips(self) -> list[str]:
+        with self._lock:
+            ordered = list(self.ordered_ips)
+            snapshots = dict(self.snapshots_by_ip)
+        return [
+            ip
+            for ip in ordered
+            if ip in snapshots and snapshots[ip].connected
+        ]
+
+    def build_app_snapshot(
+        self,
+        *,
+        current_video_page: int = 0,
+        video_page_size: int = 10,
+        visible_video_ips: tuple[str, ...] = (),
+        app_mode: AppMode = AppMode.NORMAL,
+        firmware_window_open: bool = False,
+        video_window_open: bool = False,
+    ) -> AppSnapshot:
+        with self._lock:
+            devices = dict(self.snapshots_by_ip)
+            ordered = tuple(self.ordered_ips)
+            selected = tuple(ip for ip in self.ordered_ips if ip in self.selected_ips)
+            focused_ip = self.focused_ip
+
+        total_count = len(devices)
+        connected_count = sum(1 for s in devices.values() if s.connected)
+        busy_count = sum(1 for s in devices.values() if s.command.inflight or s.command.queued_count > 0)
+        failed_count = sum(
+            1
+            for s in devices.values()
+            if s.state in (DeviceState.AUTH_FAILED, DeviceState.BACKOFF, DeviceState.DISCONNECTED)
+        )
+
+        return AppSnapshot(
+            devices=devices,
+            ordered_ips=ordered,
+            selected_ips=selected,
+            focused_ip=focused_ip,
+            total_count=total_count,
+            connected_count=connected_count,
+            busy_count=busy_count,
+            failed_count=failed_count,
+            selected_count=len(selected),
+            current_video_page=current_video_page,
+            video_page_size=video_page_size,
+            visible_video_ips=visible_video_ips,
+            app_mode=app_mode,
+            firmware_window_open=firmware_window_open,
+            video_window_open=video_window_open,
+        )
+
+################################################################################
+FILE: device_session.py
+PATH: application/core/device_session.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+import requests
+
+from domain.enums.device import AuthScheme, DeviceFlavor
+from domain.errors.app_error import AppError
+from domain.models.phase1 import Phase1Response
+
+
+def _parse_auth_scheme(value: str | None) -> AuthScheme:
+    raw = (value or "").strip().lower()
+    if raw == AuthScheme.NONE.value:
+        return AuthScheme.NONE
+    if raw == AuthScheme.BASIC.value:
+        return AuthScheme.BASIC
+    return AuthScheme.DIGEST
+
+
+def _parse_device_flavor(value: str | None) -> DeviceFlavor:
+    raw = (value or "").strip().lower()
+    if raw == DeviceFlavor.LEGACY.value:
+        return DeviceFlavor.LEGACY
+    if raw == DeviceFlavor.TTA.value:
+        return DeviceFlavor.TTA
+    if raw == DeviceFlavor.SECURITY3.value:
+        return DeviceFlavor.SECURITY3
+    return DeviceFlavor.UNKNOWN
+
+
+@dataclass(frozen=True)
+class DeviceSession:
+    base_url: str
+    root_path: str
+    auth_scheme: AuthScheme
+    username: str
+    effective_password: str
+    flavor: DeviceFlavor
+    shared_session: requests.Session | None = None
+
+    @classmethod
+    def from_phase1(
+        cls,
+        response: Phase1Response,
+        *,
+        shared_session: requests.Session | None = None,
+    ) -> "DeviceSession":
+        if not response.ok:
+            raise AppError(kind="param", message="cannot build DeviceSession from failed Phase1Response")
+
+        if not response.base_url or not response.root_path or not response.auth_scheme:
+            raise AppError(kind="param", message="Phase1Response missing session fields")
+
+        return cls(
+            base_url=response.base_url,
+            root_path=response.root_path,
+            auth_scheme=_parse_auth_scheme(response.auth_scheme),
+            username=response.effective_username or "",
+            effective_password=response.effective_password or "",
+            flavor=_parse_device_flavor(response.flavor),
+            shared_session=shared_session,
+        )
+
+    def as_client_kwargs(self, *, timeout_sec: float, verify_tls: bool) -> dict[str, Any]:
+        return {
+            "base_url": self.base_url,
+            "root_path": self.root_path,
+            "username": self.username,
+            "password": self.effective_password,
+            "auth_scheme": self.auth_scheme.value,
+            "timeout_sec": timeout_sec,
+            "verify_tls": verify_tls,
+        }
+
+################################################################################
+FILE: poll_coordinator.py
+PATH: application/core/poll_coordinator.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from application.core.device_registry import DeviceRegistry
+
+
+@dataclass(frozen=True)
+class PollSets:
+    hot_ips: tuple[str, ...]
+    warm_ips: tuple[str, ...]
+
+
+class PollCoordinator:
+    def __init__(self, *, page_size: int = 10) -> None:
+        self.page_size = int(page_size)
+        self.current_page = 0
+        self.hot_ips: tuple[str, ...] = ()
+        self.warm_ips: tuple[str, ...] = ()
+
+    def set_current_page(self, page_index: int) -> None:
+        self.current_page = max(0, int(page_index))
+
+    def compute_sets(self, registry: DeviceRegistry) -> PollSets:
+        connected = registry.iter_connected_ips()
+        start = self.current_page * self.page_size
+        end = start + self.page_size
+
+        hot = tuple(connected[start:end])
+        hot_set = set(hot)
+        warm = tuple(ip for ip in connected if ip not in hot_set)
+
+        self.hot_ips = hot
+        self.warm_ips = warm
+        return PollSets(hot_ips=hot, warm_ips=warm)
+
+    def visible_page_ips(self) -> tuple[str, ...]:
+        return self.hot_ips
+
+################################################################################
+FILE: task_scheduler.py
+PATH: application/core/task_scheduler.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+import heapq
+import itertools
+import threading
+import time
+from dataclasses import dataclass, field
+
+from application.core.device_registry import DeviceRegistry
+from domain.enums.command import CommandKind, TaskLane
+from domain.errors.app_error import AppError
+from domain.models.tasks import TaskSpec
+
+
+LANE_ORDER: tuple[TaskLane, ...] = (
+    TaskLane.CONTROL,
+    TaskLane.CONNECT,
+    TaskLane.INFO,
+    TaskLane.POLL_HOT,
+    TaskLane.POLL_WARM,
+    TaskLane.FIRMWARE,
+    TaskLane.UDP_ADMIN,
+)
+
+
+@dataclass(order=True)
+class _QueueItem:
+    sort_key: tuple[int, int, float] = field(init=False, repr=False)
+    priority: int
+    sequence: int
+    due_at: float
+    task: TaskSpec = field(compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "sort_key", (-self.priority, self.sequence, self.due_at))
+
+
+class TaskScheduler:
+    def __init__(self, *, registry: DeviceRegistry) -> None:
+        self.registry = registry
+        self._queues: dict[TaskLane, list[_QueueItem]] = {lane: [] for lane in LANE_ORDER}
+        self._sequence = itertools.count(1)
+        self._lock = threading.RLock()
+
+    def enqueue(self, task: TaskSpec) -> None:
+        due_at = float(task.due_at) if task.due_at is not None else 0.0
+        item = _QueueItem(
+            priority=int(task.priority),
+            sequence=next(self._sequence),
+            due_at=due_at,
+            task=task,
+        )
+        with self._lock:
+            heapq.heappush(self._queues[task.lane], item)
+
+    def queue_size(self, lane: TaskLane | None = None) -> int:
+        with self._lock:
+            if lane is None:
+                return sum(len(items) for items in self._queues.values())
+            return len(self._queues[lane])
+
+    def _has_pending_connect_for_device(self, device_ip: str) -> bool:
+        for lane, queue in self._queues.items():
+            for item in queue:
+                task = item.task
+                if task.device_ip == device_ip and task.command == CommandKind.CONNECT:
+                    return True
+        return False
+
+    def _is_blocked_by_connect_prerequisite(self, task: TaskSpec) -> bool:
+        if task.command == CommandKind.CONNECT:
+            return False
+
+        if not task.device_ip:
+            return False
+
+        actor = self.registry.get_actor(task.device_ip)
+        snapshot = self.registry.get_snapshot(task.device_ip)
+
+        if actor is None or snapshot is None:
+            return False
+
+        has_session = False
+        if hasattr(actor, "has_session") and callable(actor.has_session):
+            try:
+                has_session = bool(actor.has_session())
+            except Exception:
+                has_session = False
+
+        if has_session or snapshot.connected:
+            return False
+
+        return self._has_pending_connect_for_device(task.device_ip)
+
+    def dispatch_once(self) -> bool:
+        now = time.time()
+        selected_task: TaskSpec | None = None
+
+        with self._lock:
+            for lane in LANE_ORDER:
+                queue = self._queues[lane]
+                if not queue:
+                    continue
+
+                item = queue[0]
+                if item.due_at and item.due_at > now:
+                    continue
+
+                task = item.task
+                if not task.device_ip:
+                    heapq.heappop(queue)
+                    continue
+
+                actor = self.registry.get_actor(task.device_ip)
+                if actor is None:
+                    heapq.heappop(queue)
+                    raise AppError(kind="state", message="actor not found", detail=task.device_ip)
+
+                if self._is_blocked_by_connect_prerequisite(task):
+                    continue
+
+                if not actor.can_accept_task(task):
+                    continue
+
+                heapq.heappop(queue)
+                selected_task = task
+                break
+
+        if selected_task is None:
+            return False
+
+        actor = self.registry.get_actor(selected_task.device_ip)
+        if actor is None:
+            raise AppError(kind="state", message="actor missing before execution", detail=selected_task.device_ip)
+
+        actor.execute_task(selected_task)
+        return True
+
+################################################################################
+FILE: ui_update_bus.py
+PATH: application/core/ui_update_bus.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+import threading
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class UiUpdateBatch:
+    dirty_device_ids: tuple[str, ...] = ()
+    dirty_app_flags: tuple[str, ...] = ()
+    has_changes: bool = False
+
+
+class UiUpdateBus:
+    def __init__(self) -> None:
+        self._dirty_device_ids: set[str] = set()
+        self._dirty_app_flags: set[str] = set()
+        self._lock = threading.RLock()
+
+    def mark_device_dirty(self, ip: str) -> None:
+        if not ip:
+            return
+        with self._lock:
+            self._dirty_device_ids.add(ip)
+
+    def mark_devices_dirty(self, ips: list[str] | tuple[str, ...]) -> None:
+        with self._lock:
+            for ip in ips:
+                if ip:
+                    self._dirty_device_ids.add(ip)
+
+    def mark_app_dirty(self, flag: str) -> None:
+        if not flag:
+            return
+        with self._lock:
+            self._dirty_app_flags.add(flag)
+
+    def flush(self) -> UiUpdateBatch:
+        with self._lock:
+            devices = tuple(sorted(self._dirty_device_ids))
+            app_flags = tuple(sorted(self._dirty_app_flags))
+            self._dirty_device_ids.clear()
+            self._dirty_app_flags.clear()
+
+        return UiUpdateBatch(
+            dirty_device_ids=devices,
+            dirty_app_flags=app_flags,
+            has_changes=bool(devices or app_flags),
+        )
+

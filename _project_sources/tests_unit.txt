@@ -1,0 +1,980 @@
+================================================================================
+FOLDER: tests/unit
+FILE COUNT: 11
+================================================================================
+
+FILES:
+- test_control_maps.py
+- test_device_actor.py
+- test_device_registry.py
+- test_digest_auth.py
+- test_display_names.py
+- test_info_parser.py
+- test_models_smoke.py
+- test_scheduler_basic.py
+- test_settings_defaults.py
+- test_status_parser.py
+- test_video_profiles.py
+
+
+################################################################################
+FILE: test_control_maps.py
+PATH: tests/unit/test_control_maps.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+from infra.device.control_repository import (
+    FOCUS_MAP,
+    ICR_MAP,
+    PT_DIR_MAP,
+    TDN_MAP,
+    ZOOM_MAP,
+    parse_pt_speed,
+)
+
+
+def test_pt_dir_map_contains_expected_actions() -> None:
+    assert PT_DIR_MAP["up"] == "up"
+    assert PT_DIR_MAP["stop"] == "stop"
+    assert PT_DIR_MAP["leftdown"] == "leftdown"
+
+
+def test_zoom_and_focus_maps() -> None:
+    assert ZOOM_MAP["in"] == "zoomin,-1"
+    assert ZOOM_MAP["1x"] is None
+    assert FOCUS_MAP["near"] == "focusnear,-1"
+    assert FOCUS_MAP["auto"] is None
+
+
+def test_tdn_icr_maps() -> None:
+    assert TDN_MAP["auto"] == "0"
+    assert TDN_MAP["day"] == "2"
+    assert ICR_MAP["auto"] == "0"
+    assert ICR_MAP["on"] == "1"
+    assert ICR_MAP["off"] == "2"
+
+
+def test_parse_pt_speed_bounds() -> None:
+    assert parse_pt_speed(None) == 5
+    assert parse_pt_speed("0") == 1
+    assert parse_pt_speed("9") == 8
+    assert parse_pt_speed("3") == 3
+
+################################################################################
+FILE: test_device_actor.py
+PATH: tests/unit/test_device_actor.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from application.core.device_actor import DeviceActor
+from application.core.device_registry import DeviceRegistry
+from application.core.ui_update_bus import UiUpdateBus
+from domain.enums.command import CommandKind, TaskLane
+from domain.enums.device import DeviceState
+from domain.models.phase1 import Phase1Request, Phase1Response
+from domain.models.tasks import TaskSpec
+
+
+@dataclass
+class _FakeConnectService:
+    response: Phase1Response
+
+    def connect(self, request: Phase1Request) -> Phase1Response:
+        return self.response
+
+
+class _FakeInfoRepository:
+    def build_client(self, **kwargs):
+        return object()
+
+    def read_info_kv(self, client):
+        class Result:
+            merged_kv = {
+                "NET_MAC": "AA:BB:CC:DD:EE:FF",
+                "SYS_MODELNAME_ID": "TRN-1000",
+                "SYS_VERSION": "V1.2.3",
+                "SYS_BOARDID": "BOARD-1",
+                "SYS_MODULE_TYPE": "CAM",
+                "SYS_MODULE_DETAIL": "4M",
+                "SYS_PTZ_TYPE": "NONE",
+                "SYS_ZOOMMODULE": "NO",
+            }
+
+        return Result()
+
+
+class _FakeStatusRepository:
+    def build_client(self, **kwargs):
+        return object()
+
+    def read_status_kv(self, client):
+        class Result:
+            merged_kv = {
+                "SYS_CURRENTTIME": "2026/04/28 10:00:00",
+                "SYS_BOARDTEMP": "44",
+                "ETHTOOL": "1000M",
+                "GRS_VENCBITRATE1": "4096",
+                "GRS_VENCFRAME1": "30",
+                "GIS_SENSOR1": "1",
+                "GIS_ALARM1": "0",
+            }
+
+        return Result()
+
+
+class _FakeControlRepository:
+    def build_client(self, **kwargs):
+        return object()
+
+    def reboot(self, client):
+        class Result:
+            response_text = "SYS_REBOOT=1"
+
+        return Result()
+
+
+def _build_actor() -> tuple[DeviceRegistry, UiUpdateBus, DeviceActor]:
+    registry = DeviceRegistry()
+    registry.ensure_device("192.168.10.100")
+    ui_bus = UiUpdateBus()
+
+    response = Phase1Response(
+        ok=True,
+        base_url="https://192.168.10.100:443",
+        root_path="/httpapi/",
+        auth_scheme="digest",
+        flavor="legacy",
+        sys_version="V1.0.0",
+        effective_username="admin",
+        effective_password="123",
+    )
+
+    actor = DeviceActor(
+        ip="192.168.10.100",
+        registry=registry,
+        ui_update_bus=ui_bus,
+        connect_service=_FakeConnectService(response=response),
+        info_repository=_FakeInfoRepository(),
+        status_repository=_FakeStatusRepository(),
+        control_repository=_FakeControlRepository(),
+        verify_tls=False,
+        default_timeout_sec=6.0,
+    )
+    registry.attach_actor("192.168.10.100", actor)
+    return registry, ui_bus, actor
+
+
+def test_device_actor_connect_creates_session_and_updates_snapshot() -> None:
+    registry, ui_bus, actor = _build_actor()
+
+    task = TaskSpec(
+        task_id="connect-1",
+        device_ip="192.168.10.100",
+        command=CommandKind.CONNECT,
+        lane=TaskLane.CONNECT,
+        payload={"request": Phase1Request(ip="192.168.10.100")},
+    )
+
+    actor.execute_task(task)
+
+    snapshot = registry.require_snapshot("192.168.10.100")
+    assert actor.session is not None
+    assert snapshot.connected is True
+    assert snapshot.state == DeviceState.READY
+    assert snapshot.sys_version == "V1.0.0"
+
+    batch = ui_bus.flush()
+    assert "192.168.10.100" in batch.dirty_device_ids
+
+
+def test_device_actor_per_device_inflight_one() -> None:
+    registry, _, actor = _build_actor()
+
+    task = TaskSpec(
+        task_id="connect-1",
+        device_ip="192.168.10.100",
+        command=CommandKind.CONNECT,
+        lane=TaskLane.CONNECT,
+        payload={"request": Phase1Request(ip="192.168.10.100")},
+    )
+
+    assert actor.can_accept_task(task) is True
+    actor.begin_task(task)
+    assert actor.can_accept_task(task) is False
+    actor.finish_task(message="done")
+    assert actor.can_accept_task(task) is True
+
+
+def test_device_actor_info_status_control_flow() -> None:
+    registry, _, actor = _build_actor()
+
+    connect_task = TaskSpec(
+        task_id="connect-1",
+        device_ip="192.168.10.100",
+        command=CommandKind.CONNECT,
+        lane=TaskLane.CONNECT,
+        payload={"request": Phase1Request(ip="192.168.10.100")},
+    )
+    actor.execute_task(connect_task)
+
+    info_task = TaskSpec(
+        task_id="info-1",
+        device_ip="192.168.10.100",
+        command=CommandKind.INFO_LOAD,
+        lane=TaskLane.INFO,
+        payload={},
+    )
+    actor.execute_task(info_task)
+
+    status_task = TaskSpec(
+        task_id="poll-1",
+        device_ip="192.168.10.100",
+        command=CommandKind.STATUS_POLL,
+        lane=TaskLane.POLL_HOT,
+        payload={"hot": True},
+    )
+    actor.execute_task(status_task)
+
+    control_task = TaskSpec(
+        task_id="control-1",
+        device_ip="192.168.10.100",
+        command=CommandKind.CONTROL,
+        lane=TaskLane.CONTROL,
+        payload={"handler": "reboot", "kwargs": {}},
+    )
+    actor.execute_task(control_task)
+
+    snapshot = registry.require_snapshot("192.168.10.100")
+    assert snapshot.info_loaded is True
+    assert snapshot.model == "TRN-1000"
+    assert snapshot.metrics.temp_text == "44"
+    assert snapshot.command.last_message == "reboot completed"
+
+################################################################################
+FILE: test_device_registry.py
+PATH: tests/unit/test_device_registry.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+from application.core.device_registry import DeviceRegistry
+from domain.enums.app_mode import AppMode
+from domain.enums.device import DeviceState
+
+
+def test_registry_tracks_devices_selection_and_focus() -> None:
+    registry = DeviceRegistry()
+
+    registry.ensure_device("192.168.10.10")
+    registry.ensure_device("192.168.10.11")
+
+    registry.set_selected("192.168.10.10", True)
+    registry.set_focused("192.168.10.11")
+
+    assert registry.ordered_ips == ["192.168.10.10", "192.168.10.11"]
+    assert "192.168.10.10" in registry.selected_ips
+    assert registry.focused_ip == "192.168.10.11"
+
+    snap = registry.get_snapshot("192.168.10.11")
+    assert snap is not None
+    assert snap.focused is True
+
+
+def test_registry_build_app_snapshot_counts() -> None:
+    registry = DeviceRegistry()
+    registry.ensure_device("192.168.10.10")
+    registry.ensure_device("192.168.10.11")
+
+    registry.update_snapshot("192.168.10.10", connected=True, state=DeviceState.READY)
+    registry.update_snapshot("192.168.10.11", state=DeviceState.AUTH_FAILED)
+
+    app = registry.build_app_snapshot(
+        current_video_page=0,
+        video_page_size=10,
+        visible_video_ips=("192.168.10.10",),
+        app_mode=AppMode.NORMAL,
+    )
+
+    assert app.total_count == 2
+    assert app.connected_count == 1
+    assert app.failed_count == 1
+    assert app.visible_video_ips == ("192.168.10.10",)
+
+################################################################################
+FILE: test_digest_auth.py
+PATH: tests/unit/test_digest_auth.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+from infra.network.digest_auth import (
+    DigestChallenge,
+    build_digest_authorization,
+    parse_www_authenticate_digest,
+)
+
+
+def test_parse_www_authenticate_digest() -> None:
+    header = (
+        'Digest realm="IP Camera", nonce="abc123", qop="auth", '
+        'opaque="xyz", algorithm=MD5'
+    )
+
+    parsed = parse_www_authenticate_digest(header)
+
+    assert parsed.realm == "IP Camera"
+    assert parsed.nonce == "abc123"
+    assert parsed.qop == "auth"
+    assert parsed.opaque == "xyz"
+    assert parsed.algorithm == "MD5"
+
+
+def test_build_digest_authorization_contains_required_fields() -> None:
+    challenge = DigestChallenge(
+        realm="IP Camera",
+        nonce="abc123",
+        qop="auth",
+        opaque="xyz",
+        algorithm="MD5",
+    )
+
+    authz = build_digest_authorization(
+        method="GET",
+        url="https://192.168.10.100:443/httpapi/ReadParam?action=readparam&SYS_VERSION=0",
+        username="admin",
+        password="123",
+        challenge=challenge,
+        nc=1,
+        cnonce="deadbeef",
+    )
+
+    assert authz.startswith("Digest ")
+    assert 'username="admin"' in authz
+    assert 'realm="IP Camera"' in authz
+    assert 'nonce="abc123"' in authz
+    assert 'opaque="xyz"' in authz
+    assert "qop=auth" in authz
+    assert "nc=00000001" in authz
+    assert 'cnonce="deadbeef"' in authz
+
+################################################################################
+FILE: test_display_names.py
+PATH: tests/unit/test_display_names.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+from common.display.display_names import display_name
+from common.display.enum_formatters import (
+    format_display_value,
+    format_local_ip_mode,
+    format_sys_mode,
+)
+
+
+def test_display_name_known_key() -> None:
+    assert display_name("SYS_VERSION") == "Firmware"
+    assert display_name("NET_RTSPPORT") == "RTSP Port"
+    assert display_name("CAM_READMODULEVERSION") == "Module Version"
+
+
+def test_display_name_unknown_key_fallback() -> None:
+    assert display_name("SOME_UNKNOWN_KEY") == "Some Unknown Key"
+    assert display_name("") == "-"
+
+
+def test_enum_formatters() -> None:
+    assert format_sys_mode("0") == "Encoder"
+    assert format_sys_mode("1") == "Decoder"
+    assert format_sys_mode("2") == "Duplex"
+
+    assert format_local_ip_mode("0") == "Fixed IP"
+    assert format_local_ip_mode("1") == "DHCP"
+
+    assert format_display_value("SYS_MODE", "2") == "Duplex"
+    assert format_display_value("NET_LOCALIPMODE", "1") == "DHCP"
+    assert format_display_value("SYS_VERSION", "V1.2.3") == "V1.2.3"
+
+################################################################################
+FILE: test_info_parser.py
+PATH: tests/unit/test_info_parser.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+from infra.device.info_repository import (
+    build_disk_text,
+    build_info_summary_map,
+    build_missing_keys,
+    merge_nonempty_kv,
+)
+
+
+def test_merge_nonempty_kv_prefers_nonempty_later_values() -> None:
+    a = {"SYS_VERSION": "V1.0.0", "SYS_MODELNAME": ""}
+    b = {"SYS_MODELNAME": "ABC-1000", "SYS_BOARDID": "12"}
+    merged = merge_nonempty_kv(a, b)
+
+    assert merged["SYS_VERSION"] == "V1.0.0"
+    assert merged["SYS_MODELNAME"] == "ABC-1000"
+    assert merged["SYS_BOARDID"] == "12"
+
+
+def test_build_disk_text() -> None:
+    kv = {
+        "REC_DISKTYPE": "SD",
+        "REC_DISKSIZE": "64GB",
+        "REC_DISKAVAILABLE": "32GB",
+    }
+    assert build_disk_text(kv) == "SD 32GB / 64GB"
+
+
+def test_build_info_summary_map() -> None:
+    kv = {
+        "NET_MAC": "AA:BB:CC:DD:EE:FF",
+        "SYS_MODELNAME_ID": "TRN-1000",
+        "SYS_VERSION": "V1.2.3",
+        "SYS_MODE": "0",
+        "CAM_READMODULEVERSION": "M-1.0",
+        "CAM_READMECAVERSION": "P-2.0",
+        "NET_LOCALIPMODE": "1",
+        "TEST_Power_CheckString": "POE",
+        "SYS_STARTTIME": "2026/04/27 10:00:00",
+        "REC_DISKTYPE": "SD",
+        "REC_DISKSIZE": "128GB",
+        "REC_DISKAVAILABLE": "100GB",
+        "SYS_AI_VERSION": "AI-1.0",
+        "SYS_RCV_VERSION": "RCV-2.0",
+    }
+
+    summary = build_info_summary_map(kv)
+
+    assert summary["mac"] == "AA:BB:CC:DD:EE:FF"
+    assert summary["sys_modelname"] == "TRN-1000"
+    assert summary["sys_version"] == "V1.2.3"
+    assert summary["sys_mode"] == "Encoder"
+    assert summary["local_ip_mode"] == "DHCP"
+    assert summary["disk"] == "SD 100GB / 128GB"
+
+
+def test_build_missing_keys() -> None:
+    missing = build_missing_keys(("A", "B", "C"), {"A": "1", "B": ""})
+    assert missing == ("B", "C")
+
+################################################################################
+FILE: test_models_smoke.py
+PATH: tests/unit/test_models_smoke.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+from domain.enums.app_mode import AppMode
+from domain.enums.device import DeviceFlavor, DeviceState
+from domain.enums.firmware import FirmwareFailureCode, FirmwareJobState
+from domain.models.app_snapshot import AppSnapshot
+from domain.models.device_snapshot import DeviceSnapshot
+from domain.models.firmware_models import (
+    FirmwareBatchSnapshot,
+    FirmwareJob,
+    FirmwareJobResult,
+    FirmwareTarget,
+)
+from domain.models.phase1 import Phase1Request, Phase1Response
+from domain.models.tasks import TaskSpec
+from domain.enums.command import CommandKind, TaskLane
+
+
+def test_device_snapshot_smoke() -> None:
+    snapshot = DeviceSnapshot(
+        ip="192.168.10.100",
+        state=DeviceState.READY,
+        connected=True,
+        model="TRN-1000",
+        firmware="V1.0.0",
+        flavor=DeviceFlavor.LEGACY,
+    )
+
+    assert snapshot.ip == "192.168.10.100"
+    assert snapshot.state == DeviceState.READY
+    assert snapshot.connected is True
+    assert snapshot.model == "TRN-1000"
+
+
+def test_app_snapshot_smoke() -> None:
+    app = AppSnapshot(
+        total_count=3,
+        connected_count=2,
+        selected_count=1,
+        app_mode=AppMode.NORMAL,
+    )
+
+    assert app.total_count == 3
+    assert app.connected_count == 2
+    assert app.app_mode == AppMode.NORMAL
+
+
+def test_firmware_models_smoke() -> None:
+    target = FirmwareTarget(
+        ip="192.168.10.101",
+        port=443,
+        base_url="https://192.168.10.101:443",
+        root_path="/httpapi/",
+        auth_scheme="digest",
+        username="admin",
+        password="!camera1108",
+        model="TRN-2000",
+        current_version_hint="V1.0.0",
+    )
+
+    job = FirmwareJob(
+        job_id="job-1",
+        batch_id="batch-1",
+        target=target,
+        firmware_path="C:/fw/progress.html",
+        verify_tls=False,
+        state=FirmwareJobState.UPLOAD_PENDING,
+    )
+
+    result = FirmwareJobResult(
+        ok=False,
+        job_id="job-1",
+        batch_id="batch-1",
+        ip=target.ip,
+        final_state=FirmwareJobState.FAILED,
+        failure_code=FirmwareFailureCode.VERSION_UNCHANGED,
+        message="version unchanged",
+    )
+
+    batch = FirmwareBatchSnapshot(
+        batch_id="batch-1",
+        total_count=1,
+        queued_count=0,
+        upload_pending_count=1,
+        uploading_count=0,
+        rebooting_count=0,
+        reconnecting_count=0,
+        verifying_count=0,
+        success_count=0,
+        failed_count=0,
+    )
+
+    assert job.target.ip == "192.168.10.101"
+    assert job.state == FirmwareJobState.UPLOAD_PENDING
+    assert result.failure_code == FirmwareFailureCode.VERSION_UNCHANGED
+    assert batch.total_count == 1
+
+
+def test_phase1_models_smoke() -> None:
+    req = Phase1Request(ip="192.168.10.100")
+    resp = Phase1Response(
+        ok=True,
+        base_url="https://192.168.10.100:443",
+        root_path="/httpapi/",
+        auth_scheme="digest",
+        flavor="legacy",
+        sys_version="V1.0.0",
+        effective_username="admin",
+        effective_password="!camera1108",
+    )
+
+    assert req.username == "admin"
+    assert req.password == "123"
+    assert req.sec3_username == "TruenTest"
+    assert resp.ok is True
+    assert resp.sys_version == "V1.0.0"
+
+
+def test_task_spec_smoke() -> None:
+    task = TaskSpec(
+        task_id="task-1",
+        device_ip="192.168.10.100",
+        command=CommandKind.CONNECT,
+        lane=TaskLane.CONNECT,
+        priority=10,
+    )
+
+    assert task.task_id == "task-1"
+    assert task.command == CommandKind.CONNECT
+    assert task.lane == TaskLane.CONNECT
+
+################################################################################
+FILE: test_scheduler_basic.py
+PATH: tests/unit/test_scheduler_basic.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+from application.core.device_actor import DeviceActor
+from application.core.device_registry import DeviceRegistry
+from application.core.task_scheduler import TaskScheduler
+from application.core.ui_update_bus import UiUpdateBus
+from domain.enums.command import CommandKind, TaskLane
+from domain.models.phase1 import Phase1Request, Phase1Response
+from domain.models.tasks import TaskSpec
+
+
+class _RecordingConnectService:
+    def connect(self, request: Phase1Request) -> Phase1Response:
+        return Phase1Response(
+            ok=True,
+            base_url=f"https://{request.ip}:443",
+            root_path="/httpapi/",
+            auth_scheme="digest",
+            flavor="legacy",
+            sys_version="V1.0.0",
+            effective_username="admin",
+            effective_password="123",
+        )
+
+
+class _NoopInfoRepository:
+    def build_client(self, **kwargs):
+        return object()
+
+    def read_info_kv(self, client):
+        class Result:
+            merged_kv = {"SYS_VERSION": "V1.0.0"}
+
+        return Result()
+
+
+class _NoopStatusRepository:
+    def build_client(self, **kwargs):
+        return object()
+
+    def read_status_kv(self, client):
+        class Result:
+            merged_kv = {}
+
+        return Result()
+
+
+class _RecordingControlRepository:
+    def __init__(self, record: list[str]) -> None:
+        self.record = record
+
+    def build_client(self, **kwargs):
+        return object()
+
+    def reboot(self, client):
+        self.record.append("control:reboot")
+
+        class Result:
+            response_text = "ok"
+
+        return Result()
+
+
+def _build_scheduler_with_actor(record: list[str]) -> tuple[DeviceRegistry, TaskScheduler]:
+    registry = DeviceRegistry()
+    registry.ensure_device("192.168.10.100")
+    ui_bus = UiUpdateBus()
+
+    actor = DeviceActor(
+        ip="192.168.10.100",
+        registry=registry,
+        ui_update_bus=ui_bus,
+        connect_service=_RecordingConnectService(),
+        info_repository=_NoopInfoRepository(),
+        status_repository=_NoopStatusRepository(),
+        control_repository=_RecordingControlRepository(record),
+        verify_tls=False,
+        default_timeout_sec=6.0,
+    )
+    registry.attach_actor("192.168.10.100", actor)
+
+    scheduler = TaskScheduler(registry=registry)
+    return registry, scheduler
+
+
+def test_scheduler_prefers_control_lane_over_poll() -> None:
+    record: list[str] = []
+    registry, scheduler = _build_scheduler_with_actor(record)
+
+    # connect first so control can run without session error
+    scheduler.enqueue(
+        TaskSpec(
+            task_id="connect-1",
+            device_ip="192.168.10.100",
+            command=CommandKind.CONNECT,
+            lane=TaskLane.CONNECT,
+            priority=10,
+            payload={"request": Phase1Request(ip="192.168.10.100")},
+        )
+    )
+    scheduler.run_until_idle()
+
+    scheduler.enqueue(
+        TaskSpec(
+            task_id="poll-1",
+            device_ip="192.168.10.100",
+            command=CommandKind.STATUS_POLL,
+            lane=TaskLane.POLL_HOT,
+            priority=1,
+            payload={},
+        )
+    )
+    scheduler.enqueue(
+        TaskSpec(
+            task_id="control-1",
+            device_ip="192.168.10.100",
+            command=CommandKind.CONTROL,
+            lane=TaskLane.CONTROL,
+            priority=1,
+            payload={"handler": "reboot", "kwargs": {}},
+        )
+    )
+
+    # first dispatch should execute control lane before poll_hot
+    scheduler.dispatch_once()
+    assert record == ["control:reboot"]
+
+
+def test_scheduler_respects_device_busy_and_requeues() -> None:
+    record: list[str] = []
+    registry, scheduler = _build_scheduler_with_actor(record)
+    actor = registry.get_actor("192.168.10.100")
+    assert actor is not None
+
+    fake_busy = TaskSpec(
+        task_id="busy-1",
+        device_ip="192.168.10.100",
+        command=CommandKind.CONNECT,
+        lane=TaskLane.CONNECT,
+        payload={"request": Phase1Request(ip="192.168.10.100")},
+    )
+    actor.begin_task(fake_busy)
+
+    queued = TaskSpec(
+        task_id="info-1",
+        device_ip="192.168.10.100",
+        command=CommandKind.INFO_LOAD,
+        lane=TaskLane.INFO,
+        payload={},
+    )
+    scheduler.enqueue(queued)
+
+    dispatched = scheduler.dispatch_once()
+    assert dispatched is False
+    assert scheduler.queue_size(TaskLane.INFO) == 1
+
+    actor.finish_task(message="released")
+
+
+def test_scheduler_run_until_idle() -> None:
+    record: list[str] = []
+    _, scheduler = _build_scheduler_with_actor(record)
+
+    scheduler.enqueue(
+        TaskSpec(
+            task_id="connect-1",
+            device_ip="192.168.10.100",
+            command=CommandKind.CONNECT,
+            lane=TaskLane.CONNECT,
+            payload={"request": Phase1Request(ip="192.168.10.100")},
+        )
+    )
+    scheduler.enqueue(
+        TaskSpec(
+            task_id="control-1",
+            device_ip="192.168.10.100",
+            command=CommandKind.CONTROL,
+            lane=TaskLane.CONTROL,
+            payload={"handler": "reboot", "kwargs": {}},
+        )
+    )
+
+    steps = scheduler.run_until_idle()
+    assert steps == 2
+    assert record == ["control:reboot"]
+
+################################################################################
+FILE: test_settings_defaults.py
+PATH: tests/unit/test_settings_defaults.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+from config.app_settings import AppSettings
+from config.firmware_settings import FirmwareSettings
+from config.scheduler_settings import SchedulerSettings
+from config.ui_settings import UiSettings
+
+
+def test_app_settings_defaults_match_current_operation() -> None:
+    settings = AppSettings.load()
+
+    assert settings.default_port == 0
+    assert settings.verify_tls is False
+
+    assert settings.firmware_credentials.username == "admin"
+    assert settings.firmware_credentials.password == "123"
+
+    assert settings.tta_credentials.username == "admin"
+    assert settings.tta_credentials.password == "!camera1108"
+
+    assert settings.security3_credentials.username == "TruenTest"
+    assert settings.security3_credentials.password == "!camera1108"
+
+    assert settings.default_username == "admin"
+    assert settings.default_password == "123"
+    assert settings.target_password == "!camera1108"
+    assert settings.sec3_username == "TruenTest"
+    assert settings.sec3_password == "!camera1108"
+
+
+def test_scheduler_defaults() -> None:
+    settings = SchedulerSettings.load()
+
+    assert settings.global_http_max == 16
+    assert settings.max_inflight_per_device == 1
+    assert settings.hot_page_size == 10
+
+
+def test_ui_defaults() -> None:
+    settings = UiSettings.load()
+
+    assert settings.device_page_size == 10
+    assert settings.ui_flush_ms == 100
+    assert "ip" in settings.default_visible_columns
+    assert "firmware" in settings.default_visible_columns
+
+
+def test_firmware_defaults() -> None:
+    settings = FirmwareSettings.load()
+
+    assert settings.upload_parallelism_default == 16
+    assert settings.upload_parallelism_max == 24
+    assert settings.reboot_wait_sec == 40.0
+    assert settings.reconnect_interval_sec == 2.0
+    assert settings.reconnect_timeout_sec == 120.0
+    assert settings.verify_max_attempts == 3
+    assert settings.verify_interval_sec == 3.0
+
+################################################################################
+FILE: test_status_parser.py
+PATH: tests/unit/test_status_parser.py
+EXT: .py
+################################################################################
+
+
+from __future__ import annotations
+
+from infra.device.status_repository import (
+    build_missing_keys,
+    build_rate_text,
+    build_status_summary_map,
+    merge_nonempty_kv,
+)
+
+
+def test_build_rate_text() -> None:
+    kv = {
+        "GRS_VENCBITRATE1": "4096",
+        "GRS_VENCFRAME1": "30",
+    }
+    assert build_rate_text(kv, 1) == "4096kbps / 30fps"
+    assert build_rate_text({}, 1) == "-"
+
+
+def test_build_status_summary_map() -> None:
+    kv = {
+        "GIS_CDS": "88",
+        "CAM_HI_CURRENT_Y": "123",
+        "GRS_VENCBITRATE1": "2048",
+        "GRS_VENCFRAME1": "25",
+        "SYS_CURRENTTIME": "2026/04/27 10:01:02",
+        "SYS_BOARDTEMP": "45",
+        "SYS_FANSTATUS": "ON",
+        "ETHTOOL": "1000Mbps",
+        "GRS_AENCBITRATE1": "64",
+        "GRS_ADECBITRATE1": "64",
+        "GRS_ADECALGORITHM1": "AAC",
+        "GRS_ADECSAMPLERATE1": "48000",
+    }
+
+    summary = build_status_summary_map(kv)
+
+    assert summary["cds"] == "88"
+    assert summary["current_y"] == "123"
+    assert summary["rate1"] == "2048kbps / 25fps"
+    assert summary["rtc"] == "2026/04/27 10:01:02"
+    assert summary["temp"] == "45"
+    assert summary["fan"] == "ON"
+    assert summary["eth"] == "1000Mbps"
+    assert summary["audio_dec_algorithm"] == "AAC"
+
+
+def test_merge_nonempty_status_kv() -> None:
+    a = {"SYS_BOARDTEMP": "40", "ETHTOOL": ""}
+    b = {"ETHTOOL": "100M", "GIS_CDS": "77"}
+    merged = merge_nonempty_kv(a, b)
+
+    assert merged["SYS_BOARDTEMP"] == "40"
+    assert merged["ETHTOOL"] == "100M"
+    assert merged["GIS_CDS"] == "77"
+
+
+def test_build_missing_keys() -> None:
+    missing = build_missing_keys(("A", "B"), {"A": "1", "B": ""})
+    assert missing == ("B",)
+
+################################################################################
+FILE: test_video_profiles.py
+PATH: tests/unit/test_video_profiles.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+from infra.device.video_profile_repository import (
+    available_profile_keys,
+    build_rtsp_profiles,
+    default_rtsp_profile,
+    is_tcs_multi_channel_model,
+)
+
+
+def test_normal_device_profiles() -> None:
+    profiles = build_rtsp_profiles(
+        ip="192.168.10.100",
+        username="admin",
+        password="123",
+        rtsp_port=554,
+        model_name="TRN-1000",
+    )
+
+    assert set(profiles.keys()) == {"primary", "secondary1", "secondary2", "secondary3"}
+    assert profiles["primary"].startswith("rtsp://admin:123@192.168.10.100:554/")
+    assert default_rtsp_profile("TRN-1000") == "primary"
+    assert available_profile_keys("TRN-1000") == ["primary", "secondary1", "secondary2", "secondary3"]
+
+
+def test_tcs_multi_channel_profiles() -> None:
+    profiles = build_rtsp_profiles(
+        ip="192.168.10.200",
+        username="admin",
+        password="!camera1108",
+        rtsp_port=8554,
+        model_name="TCS-400",
+    )
+
+    assert is_tcs_multi_channel_model("TCS-400") is True
+    assert "ch1_primary" in profiles
+    assert "ch4_secondary1" in profiles
+    assert default_rtsp_profile("TCS-400") == "ch1_primary"
+    assert available_profile_keys("TCS-400")[0] == "ch1_primary"
+

@@ -1,0 +1,228 @@
+================================================================================
+FOLDER: config
+FILE COUNT: 5
+================================================================================
+
+FILES:
+- app_settings.py
+- constants.py
+- firmware_settings.py
+- scheduler_settings.py
+- ui_settings.py
+
+
+################################################################################
+FILE: app_settings.py
+PATH: config/app_settings.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+
+@dataclass(frozen=True)
+class TimeoutSettings:
+    connect_sec: float = 3.0
+    read_sec: float = 6.0
+
+
+@dataclass(frozen=True)
+class RetrySettings:
+    max_attempts: int = 2
+    backoff_base_sec: float = 0.25
+    backoff_jitter_sec: float = 0.15
+    retry_on_status: tuple[int, ...] = (502, 503, 504)
+
+
+@dataclass(frozen=True)
+class CredentialSettings:
+    username: str
+    password: str
+
+
+@dataclass(frozen=True)
+class AppSettings:
+    default_port: int = 0  # 0 = auto
+    verify_tls: bool = False
+    allowed_ip: str = "192.168.10.2"
+
+    timeout: TimeoutSettings = field(default_factory=TimeoutSettings)
+    retry: RetrySettings = field(default_factory=RetrySettings)
+
+    firmware_credentials: CredentialSettings = field(
+        default_factory=lambda: CredentialSettings(username="admin", password="123")
+    )
+    tta_credentials: CredentialSettings = field(
+        default_factory=lambda: CredentialSettings(username="admin", password="!camera1108")
+    )
+    security3_credentials: CredentialSettings = field(
+        default_factory=lambda: CredentialSettings(username="TruenTest", password="!camera1108")
+    )
+
+    @property
+    def default_username(self) -> str:
+        return self.firmware_credentials.username
+
+    @property
+    def default_password(self) -> str:
+        return self.firmware_credentials.password
+
+    @property
+    def target_password(self) -> str:
+        # 현재 운영 기준에서 TTA / 보안 3.0 최종 비밀번호는 동일하다.
+        return self.tta_credentials.password
+
+    @property
+    def sec3_username(self) -> str:
+        return self.security3_credentials.username
+
+    @property
+    def sec3_password(self) -> str:
+        return self.security3_credentials.password
+
+    @property
+    def tta_username(self) -> str:
+        return self.tta_credentials.username
+
+    @property
+    def tta_password(self) -> str:
+        return self.tta_credentials.password
+
+    @classmethod
+    def load(cls) -> "AppSettings":
+        return cls()
+
+################################################################################
+FILE: constants.py
+PATH: config/constants.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+from pathlib import Path
+
+APP_NAME = "Prod_Test_Tool_v3"
+APP_DISPLAY_NAME = "Prod Test Tool v3"
+APP_ORG_NAME = "Truen"
+
+APP_LOG_FILENAME = "prod_test_tool_v3.log"
+
+DEFAULT_LOG_DIR_NAME = "logs"
+DEFAULT_LOG_LEVEL_NAME = "INFO"
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_LOG_DIR = PROJECT_ROOT / DEFAULT_LOG_DIR_NAME
+
+################################################################################
+FILE: firmware_settings.py
+PATH: config/firmware_settings.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class FirmwareSettings:
+    upload_parallelism_default: int = 16
+    upload_parallelism_max: int = 24
+
+    reboot_wait_sec: float = 40.0
+    reconnect_interval_sec: float = 2.0
+    reconnect_timeout_sec: float = 120.0
+
+    verify_max_attempts: int = 3
+    verify_interval_sec: float = 3.0
+
+    upload_timeout_sec: float = 40.0
+    probe_timeout_sec: float = 5.0
+    verify_read_timeout_sec: float = 10.0
+
+    ui_flush_ms: int = 100
+    delay_scheduler_tick_ms: int = 200
+
+    @classmethod
+    def load(cls) -> "FirmwareSettings":
+        return cls()
+
+################################################################################
+FILE: scheduler_settings.py
+PATH: config/scheduler_settings.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class SchedulerSettings:
+    scheduler_tick_ms: int = 50
+    retry_tick_ms: int = 100
+
+    global_http_max: int = 16
+
+    control_max: int = 6
+    connect_max: int = 4
+    info_manual_max: int = 4
+    poll_hot_max: int = 4
+    poll_warm_max: int = 2
+    firmware_max: int = 1
+    udp_admin_max: int = 1
+
+    max_inflight_per_device: int = 1
+
+    hot_poll_interval_sec: float = 1.0
+    warm_poll_interval_sec: float = 15.0
+    hot_page_size: int = 10
+
+    @classmethod
+    def load(cls) -> "SchedulerSettings":
+        return cls()
+
+################################################################################
+FILE: ui_settings.py
+PATH: config/ui_settings.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+
+@dataclass(frozen=True)
+class UiSettings:
+    device_page_size: int = 10
+    ui_flush_ms: int = 100
+    focused_flush_ms: int = 50
+    log_flush_ms: int = 100
+
+    default_visible_columns: tuple[str, ...] = field(
+        default_factory=lambda: (
+            "ip",
+            "connected",
+            "state",
+            "model",
+            "firmware",
+            "mac",
+            "board_id",
+            "ptz_type",
+            "temp",
+            "eth",
+            "rate1",
+            "sensor",
+            "alarm",
+        )
+    )
+
+    @classmethod
+    def load(cls) -> "UiSettings":
+        return cls()
+

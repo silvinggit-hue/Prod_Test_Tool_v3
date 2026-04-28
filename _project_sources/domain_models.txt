@@ -1,0 +1,385 @@
+================================================================================
+FOLDER: domain/models
+FILE COUNT: 6
+================================================================================
+
+FILES:
+- app_snapshot.py
+- device_snapshot.py
+- device_state.py
+- firmware_models.py
+- phase1.py
+- tasks.py
+
+
+################################################################################
+FILE: app_snapshot.py
+PATH: domain/models/app_snapshot.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+from domain.enums.app_mode import AppMode
+from domain.models.device_snapshot import DeviceSnapshot
+
+
+@dataclass(frozen=True)
+class AppSnapshot:
+    devices: dict[str, DeviceSnapshot] = field(default_factory=dict)
+    ordered_ips: tuple[str, ...] = ()
+    selected_ips: tuple[str, ...] = ()
+    focused_ip: str | None = None
+
+    total_count: int = 0
+    connected_count: int = 0
+    busy_count: int = 0
+    failed_count: int = 0
+    selected_count: int = 0
+
+    current_video_page: int = 0
+    video_page_size: int = 10
+    visible_video_ips: tuple[str, ...] = ()
+
+    app_mode: AppMode = AppMode.NORMAL
+    firmware_window_open: bool = False
+    video_window_open: bool = False
+
+################################################################################
+FILE: device_snapshot.py
+PATH: domain/models/device_snapshot.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+from domain.enums.device import DeviceFlavor, DeviceState
+from domain.models.device_state import DeviceCommandState, DeviceLiveMetrics
+
+
+@dataclass(frozen=True)
+class DeviceSnapshot:
+    ip: str
+    port: int = 0
+
+    mac: str = ""
+    mac12: str = ""
+    model: str = ""
+    firmware: str = ""
+    lens: str = ""
+    note: str = ""
+
+    selected: bool = False
+    focused: bool = False
+
+    state: DeviceState = DeviceState.DISCOVERED
+    connected: bool = False
+    info_loaded: bool = False
+
+    base_url: str = ""
+    root_path: str = ""
+    auth_scheme: str = ""
+    flavor: DeviceFlavor = DeviceFlavor.UNKNOWN
+
+    username: str = ""
+    effective_password: str = ""
+
+    default_password_state: bool | None = None
+    password_changed: bool | None = None
+
+    board_id: str = ""
+    module_type: str = ""
+    module_detail: str = ""
+    ptz_type: str = ""
+    zoom_module: str = ""
+
+    sys_version: str = ""
+    last_success_at: float | None = None
+
+    # Step 5 UI용 표시 필드
+    sys_mode_text: str = "-"
+    module_version: str = "-"
+    ptz_fw: str = "-"
+    extra_id: str = "-"
+    linkdown_num: str = "-"
+    local_ip_mode: str = "-"
+    power_type: str = "-"
+    startup_time: str = "-"
+    disk_text: str = "-"
+    ai_version: str = "-"
+    rcv_version: str = "-"
+    air_wiper: str = "-"
+    ethernet_speed_rate: str = "-"
+
+    command: DeviceCommandState = field(default_factory=DeviceCommandState)
+    metrics: DeviceLiveMetrics = field(default_factory=DeviceLiveMetrics)
+
+################################################################################
+FILE: device_state.py
+PATH: domain/models/device_state.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class DeviceCommandState:
+    current_task_id: str | None = None
+    current_task_kind: str | None = None
+    queued_count: int = 0
+    inflight: bool = False
+    last_result: str = ""
+    last_message: str = ""
+    last_error_kind: str = ""
+    last_error_detail: str = ""
+    progress_percent: int = 0
+    progress_text: str = ""
+    next_retry_at: float | None = None
+
+
+@dataclass(frozen=True)
+class DeviceLiveMetrics:
+    rtc_text: str = "-"
+    temp_text: str = "-"
+    eth_text: str = "-"
+    rate1_text: str = "-"
+    rate2_text: str = "-"
+    rate3_text: str = "-"
+    rate4_text: str = "-"
+
+    audio_enc_bitrate: str = "-"
+    audio_dec_bitrate: str = "-"
+    audio_dec_algorithm: str = "-"
+    audio_dec_samplerate: str = "-"
+
+    cds_text: str = "-"
+    current_y_text: str = "-"
+    fan_text: str = "-"
+
+    sensor_leds: tuple[bool, bool, bool, bool] = (False, False, False, False)
+    alarm_leds: tuple[bool, bool, bool, bool] = (False, False, False, False)
+
+    updated_at: float | None = None
+
+################################################################################
+FILE: firmware_models.py
+PATH: domain/models/firmware_models.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from domain.enums.firmware import FirmwareFailureCode, FirmwareJobState
+
+
+@dataclass(frozen=True)
+class FirmwareTarget:
+    ip: str
+    port: int
+    base_url: str
+    root_path: str
+    auth_scheme: str
+    username: str
+    password: str
+    model: str = ""
+    current_version_hint: str | None = None
+
+
+@dataclass(frozen=True)
+class FirmwareJobResult:
+    ok: bool
+    job_id: str
+    batch_id: str
+    ip: str
+
+    before_version: str | None = None
+    after_version: str | None = None
+
+    final_state: FirmwareJobState = FirmwareJobState.FAILED
+    failure_code: FirmwareFailureCode | None = None
+    message: str = ""
+    detail: str = ""
+
+    started_at: float | None = None
+    finished_at: float | None = None
+
+
+@dataclass(frozen=True)
+class FirmwareJob:
+    job_id: str
+    batch_id: str
+    target: FirmwareTarget
+
+    firmware_path: str
+    verify_tls: bool
+
+    state: FirmwareJobState = FirmwareJobState.QUEUED
+
+    before_version: str | None = None
+    after_version: str | None = None
+
+    verify_attempts_done: int = 0
+    verify_attempts_max: int = 3
+
+    reconnect_attempts_done: int = 0
+    reconnect_interval_sec: float = 2.0
+    reconnect_timeout_sec: float = 120.0
+
+    reboot_wait_sec: float = 40.0
+    reboot_wait_until: float | None = None
+    reconnect_deadline: float | None = None
+    next_due_at: float | None = None
+
+    started_at: float | None = None
+    finished_at: float | None = None
+    last_updated_at: float | None = None
+
+    failure_code: FirmwareFailureCode | None = None
+    failure_message: str = ""
+    failure_detail: str = ""
+
+    last_log_message: str = ""
+    retry_of_job_id: str | None = None
+
+
+@dataclass(frozen=True)
+class FirmwareBatchSnapshot:
+    batch_id: str
+
+    total_count: int
+    queued_count: int
+    upload_pending_count: int
+    uploading_count: int
+    rebooting_count: int
+    reconnecting_count: int
+    verifying_count: int
+    success_count: int
+    failed_count: int
+
+    started_at: float | None = None
+    finished_at: float | None = None
+
+    upload_parallelism: int = 16
+    upload_slots_in_use: int = 0
+
+    is_terminal: bool = False
+
+
+@dataclass(frozen=True)
+class FirmwareRowModel:
+    ip: str
+    model: str
+    state_text: str
+
+    before_version: str
+    after_version: str
+
+    progress_text: str
+    result_text: str
+    failure_code_text: str
+
+    updated_at_text: str
+    elapsed_text: str
+
+    retry_candidate: bool
+
+################################################################################
+FILE: phase1.py
+PATH: domain/models/phase1.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from domain.errors.app_error import AppError
+
+
+@dataclass(frozen=True)
+class ProbeResult:
+    base_url: str
+    root_path: str
+    auth_scheme: str
+    flavor: str = "legacy"
+
+
+@dataclass(frozen=True)
+class Phase1Request:
+    ip: str
+    port: int = 0
+
+    # 초기화 직후 기본값
+    username: str = "admin"
+    password: str = "1234"
+
+    # 참고용 후보군.
+    # 실제 connect_service에서는 입력값이 1234인지 아닌지로 분기해서 사용한다.
+    password_candidates: tuple[str, ...] = ("1234", "admin", "123", "!camera1108", "!Camera1108")
+
+    # legacy/basic/TTA 최종 운영 비밀번호
+    # - 기본 펌웨어: 123
+    # - TTA: !camera1108
+    target_password: str = "123"
+
+    verify_tls: bool = False
+
+    # Security 3.0 운영 계정
+    sec3_username: str = "TruenTest"
+    sec3_password: str = "!Camera1108"
+    allowed_ip: str = "192.168.10.2"
+
+
+@dataclass(frozen=True)
+class Phase1Response:
+    ok: bool
+
+    base_url: str | None = None
+    root_path: str | None = None
+    auth_scheme: str | None = None
+    flavor: str | None = None
+
+    sys_version: str | None = None
+    effective_username: str | None = None
+    effective_password: str | None = None
+
+    recovered: bool = False
+    default_password_state: bool | None = None
+    password_changed: bool | None = None
+
+    error: AppError | None = None
+
+################################################################################
+FILE: tasks.py
+PATH: domain/models/tasks.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+from domain.enums.command import CommandKind, TaskLane
+
+
+@dataclass(frozen=True)
+class TaskSpec:
+    task_id: str
+    device_ip: str | None
+    command: CommandKind
+    lane: TaskLane
+    priority: int = 0
+    payload: dict[str, Any] = field(default_factory=dict)
+    created_at: float | None = None
+    due_at: float | None = None
+

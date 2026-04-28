@@ -1,0 +1,141 @@
+================================================================================
+FOLDER: domain/enums
+FILE COUNT: 4
+================================================================================
+
+FILES:
+- app_mode.py
+- command.py
+- device.py
+- firmware.py
+
+
+################################################################################
+FILE: app_mode.py
+PATH: domain/enums/app_mode.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+from enum import Enum
+
+
+class AppMode(str, Enum):
+    NORMAL = "normal"
+    FIRMWARE = "firmware"
+
+################################################################################
+FILE: command.py
+PATH: domain/enums/command.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+from enum import Enum
+
+
+class CommandKind(str, Enum):
+    CONNECT = "connect"
+    INFO_LOAD = "info_load"
+    STATUS_POLL = "status_poll"
+    CONTROL = "control"
+    DISCOVERY = "discovery"
+    SETIP = "setip"
+    RESET = "reset"
+    VIDEO_REFRESH = "video_refresh"
+    FIRMWARE_BATCH = "firmware_batch"
+
+
+class TaskLane(str, Enum):
+    EMERGENCY = "emergency"
+    CONTROL = "control"
+    CONNECT = "connect"
+    INFO = "info"
+    POLL_HOT = "poll_hot"
+    POLL_WARM = "poll_warm"
+    FIRMWARE = "firmware"
+    UDP_ADMIN = "udp_admin"
+
+
+class ControlKind(str, Enum):
+    PT = "pt"
+    ZOOM = "zoom"
+    FOCUS = "focus"
+    TDN = "tdn"
+    ICR = "icr"
+    SYSTEM = "system"
+    MODEL = "model"
+    RTC = "rtc"
+    EXTRA_ID = "extra_id"
+    AUDIO = "audio"
+    VIDEO_INPUT = "video_input"
+
+################################################################################
+FILE: device.py
+PATH: domain/enums/device.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+from enum import Enum
+
+
+class DeviceState(str, Enum):
+    DISCOVERED = "discovered"
+    CONNECTING = "connecting"
+    READY = "ready"
+    BACKOFF = "backoff"
+    AUTH_FAILED = "auth_failed"
+    DISCONNECTED = "disconnected"
+    FW_LOCKED = "fw_locked"
+    REMOVED = "removed"
+
+
+class AuthScheme(str, Enum):
+    NONE = "none"
+    BASIC = "basic"
+    DIGEST = "digest"
+
+
+class DeviceFlavor(str, Enum):
+    LEGACY = "legacy"
+    TTA = "tta"
+    SECURITY3 = "security3"
+    UNKNOWN = "unknown"
+
+################################################################################
+FILE: firmware.py
+PATH: domain/enums/firmware.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+from enum import Enum
+
+
+class FirmwareJobState(str, Enum):
+    QUEUED = "queued"
+    UPLOAD_PENDING = "upload_pending"
+    UPLOADING = "uploading"
+    REBOOTING = "rebooting"
+    RECONNECTING = "reconnecting"
+    VERIFYING = "verifying"
+    SUCCESS = "success"
+    FAILED = "failed"
+
+
+class FirmwareFailureCode(str, Enum):
+    BEFORE_VERSION_UNAVAILABLE = "before_version_unavailable"
+    UPLOAD_AUTH_FAILED = "upload_auth_failed"
+    UPLOAD_FILE_NOT_FOUND = "upload_file_not_found"
+    UPLOAD_HTTP_FAILED = "upload_http_failed"
+    UPLOAD_NETWORK_FAILED = "upload_network_failed"
+    RECONNECT_TIMEOUT = "reconnect_timeout"
+    VERSION_READ_FAILED = "version_read_failed"
+    VERSION_UNCHANGED = "version_unchanged"
+    UNEXPECTED_ERROR = "unexpected_error"
+

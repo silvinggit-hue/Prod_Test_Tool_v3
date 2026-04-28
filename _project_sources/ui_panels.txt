@@ -1,0 +1,285 @@
+================================================================================
+FOLDER: ui/panels
+FILE COUNT: 6
+================================================================================
+
+FILES:
+- connect_panel.py
+- control_panel.py
+- info_panel.py
+- log_panel.py
+- result_panel.py
+- status_panel.py
+
+
+################################################################################
+FILE: connect_panel.py
+PATH: ui/panels/connect_panel.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+from PyQt5.QtWidgets import (
+    QComboBox,
+    QFormLayout,
+    QGroupBox,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QVBoxLayout,
+)
+
+
+RESET_PASSWORDS = {"1234", "admin"}
+
+
+class ConnectPanel(QGroupBox):
+    def __init__(self) -> None:
+        super().__init__("Connect")
+        self._build_ui()
+        self._update_mode_hint()
+
+    def _build_ui(self) -> None:
+        self.username_edit = QLineEdit("admin")
+        self.username_edit.setPlaceholderText("현재 ID 입력")
+
+        self.password_edit = QLineEdit("1234")
+        self.password_edit.setPlaceholderText("현재 비밀번호 입력")
+        # PW 마스킹 제거
+
+        self.target_profile_combo = QComboBox()
+        self.target_profile_combo.addItem("기본 (123)", "basic")
+        self.target_profile_combo.addItem("TTA (!camera1108)", "tta")
+        self.target_profile_combo.addItem("보안3.0 (!Camera1108)", "security3")
+
+        self.mode_hint_label = QLabel("")
+        self.mode_hint_label.setWordWrap(True)
+
+        self.connect_selected_button = QPushButton("Connect Selected")
+
+        form = QFormLayout()
+        form.addRow("ID", self.username_edit)
+        form.addRow("PW", self.password_edit)
+        form.addRow("Target", self.target_profile_combo)
+
+        root = QVBoxLayout(self)
+        root.addLayout(form)
+        root.addWidget(self.mode_hint_label)
+        root.addWidget(self.connect_selected_button)
+
+        self.password_edit.textChanged.connect(self._update_mode_hint)
+
+    def entered_username(self) -> str:
+        text = self.username_edit.text().strip()
+        return text if text else "admin"
+
+    def entered_password(self) -> str:
+        return self.password_edit.text()
+
+    def is_factory_reset_password(self) -> bool:
+        return self.entered_password().strip() in RESET_PASSWORDS
+
+    def selected_target_profile(self) -> str:
+        data = self.target_profile_combo.currentData()
+        return str(data or "basic")
+
+    def target_password(self) -> str:
+        profile = self.selected_target_profile()
+        if profile == "basic":
+            return "123"
+        if profile == "tta":
+            return "!camera1108"
+        if profile == "security3":
+            return "!Camera1108"
+        return "123"
+
+    def sec3_username(self) -> str:
+        return "TruenTest"
+
+    def sec3_password(self) -> str:
+        return "!Camera1108"
+
+    def _update_mode_hint(self) -> None:
+        reset_mode = self.is_factory_reset_password()
+        self.target_profile_combo.setEnabled(reset_mode)
+
+        if reset_mode:
+            self.mode_hint_label.setText(
+                "초기화 비밀번호 감지됨. 선택한 Target 비밀번호로 변경한 뒤 접속합니다."
+            )
+        else:
+            self.mode_hint_label.setText(
+                "이미 변경된 비밀번호로 판단합니다. 입력한 ID / 비밀번호로 직접 접속을 시도합니다."
+            )
+
+################################################################################
+FILE: control_panel.py
+PATH: ui/panels/control_panel.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+from PyQt5.QtWidgets import QGridLayout, QGroupBox, QPushButton
+
+
+class ControlPanel(QGroupBox):
+    def __init__(self) -> None:
+        super().__init__("Control")
+
+        self.reboot_button = QPushButton("Reboot Selected")
+        self.sync_rtc_button = QPushButton("Sync RTC Selected")
+
+        layout = QGridLayout(self)
+        layout.addWidget(self.reboot_button, 0, 0)
+        layout.addWidget(self.sync_rtc_button, 0, 1)
+
+################################################################################
+FILE: info_panel.py
+PATH: ui/panels/info_panel.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+from PyQt5.QtWidgets import QFormLayout, QGroupBox, QLabel, QPushButton, QVBoxLayout
+
+from ui.mappers.info_summary_mapper import map_info_summary
+
+
+class InfoPanel(QGroupBox):
+    def __init__(self) -> None:
+        super().__init__("Device Info")
+
+        self._labels: dict[str, QLabel] = {}
+
+        form = QFormLayout()
+        for field_name in map_info_summary(None).keys():
+            value_label = QLabel("-")
+            value_label.setWordWrap(True)
+            self._labels[field_name] = value_label
+            form.addRow(field_name, value_label)
+
+        self.load_info_button = QPushButton("Load Info")
+
+        root = QVBoxLayout(self)
+        root.addLayout(form)
+        root.addWidget(self.load_info_button)
+
+    def set_snapshot(self, snapshot) -> None:
+        values = map_info_summary(snapshot)
+        for key, value in values.items():
+            label = self._labels.get(key)
+            if label is not None:
+                label.setText(value)
+
+    def clear(self) -> None:
+        self.set_snapshot(None)
+
+################################################################################
+FILE: log_panel.py
+PATH: ui/panels/log_panel.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+from datetime import datetime
+
+from PyQt5.QtWidgets import QGroupBox, QTextEdit, QVBoxLayout
+
+
+class LogPanel(QGroupBox):
+    def __init__(self, title: str = "System Log") -> None:
+        super().__init__(title)
+
+        self.text_edit = QTextEdit()
+        self.text_edit.setReadOnly(True)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.text_edit)
+
+    def append_line(self, text: str) -> None:
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.text_edit.append(f"[{timestamp}] {text}")
+
+    def clear(self) -> None:
+        self.text_edit.clear()
+
+################################################################################
+FILE: result_panel.py
+PATH: ui/panels/result_panel.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+from PyQt5.QtWidgets import QGroupBox, QTextEdit, QVBoxLayout
+
+
+class ResultPanel(QGroupBox):
+    def __init__(self) -> None:
+        super().__init__("Result")
+
+        self.text_edit = QTextEdit()
+        self.text_edit.setReadOnly(True)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.text_edit)
+
+    def set_text(self, text: str) -> None:
+        self.text_edit.setPlainText(text)
+
+    def append_text(self, text: str) -> None:
+        current = self.text_edit.toPlainText().strip()
+        if current:
+            self.text_edit.append(text)
+        else:
+            self.text_edit.setPlainText(text)
+
+    def clear(self) -> None:
+        self.text_edit.clear()
+
+################################################################################
+FILE: status_panel.py
+PATH: ui/panels/status_panel.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+from PyQt5.QtWidgets import QFormLayout, QGroupBox, QLabel, QPushButton, QVBoxLayout
+
+from ui.mappers.status_summary_mapper import map_status_summary
+
+
+class StatusPanel(QGroupBox):
+    def __init__(self) -> None:
+        super().__init__("Status")
+
+        self._labels: dict[str, QLabel] = {}
+
+        form = QFormLayout()
+        for field_name in map_status_summary(None).keys():
+            value_label = QLabel("-")
+            value_label.setWordWrap(True)
+            self._labels[field_name] = value_label
+            form.addRow(field_name, value_label)
+
+        self.poll_status_button = QPushButton("Poll Status")
+
+        root = QVBoxLayout(self)
+        root.addLayout(form)
+        root.addWidget(self.poll_status_button)
+
+    def set_snapshot(self, snapshot) -> None:
+        values = map_status_summary(snapshot)
+        for key, value in values.items():
+            label = self._labels.get(key)
+            if label is not None:
+                label.setText(value)
+
+    def clear(self) -> None:
+        self.set_snapshot(None)
+

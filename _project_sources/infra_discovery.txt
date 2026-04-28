@@ -1,0 +1,355 @@
+================================================================================
+FOLDER: infra/discovery
+FILE COUNT: 3
+================================================================================
+
+FILES:
+- network.py
+- packet_parser.py
+- udp_discovery.py
+
+
+################################################################################
+FILE: network.py
+PATH: infra/discovery/network.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+import socket
+
+
+def get_local_ipv4() -> str | None:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        if ip and not ip.startswith("127."):
+            return ip
+    except Exception:
+        pass
+
+    try:
+        host = socket.gethostname()
+        for info in socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM):
+            ip = info[4][0]
+            if ip and not ip.startswith("127."):
+                return ip
+    except Exception:
+        pass
+
+    return None
+
+
+def compute_directed_broadcast(ip: str, mask_bits: int) -> str:
+    parts = ip.split(".")
+    if len(parts) != 4:
+        raise ValueError("bind ip must be IPv4 like 192.168.10.2")
+
+    ip_int = 0
+    for p in parts:
+        ip_int = (ip_int << 8) | int(p)
+
+    mask = (0xFFFFFFFF << (32 - mask_bits)) & 0xFFFFFFFF
+    bcast = (ip_int & mask) | (~mask & 0xFFFFFFFF)
+
+    return ".".join(str((bcast >> shift) & 0xFF) for shift in (24, 16, 8, 0))
+
+
+def open_udp_socket(bind_ip: str, port: int, timeout: float = 0.05) -> socket.socket:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    sock.bind((bind_ip, port))
+    sock.settimeout(timeout)
+    return sock
+
+
+def safe_close_socket(sock: socket.socket | None) -> None:
+    if sock is None:
+        return
+    try:
+        sock.close()
+    except Exception:
+        pass
+
+################################################################################
+FILE: packet_parser.py
+PATH: infra/discovery/packet_parser.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from typing import Optional
+
+
+RSP_SIG = bytes.fromhex("23 68 54 10")
+REQ24 = bytes.fromhex("34 52 34 87 01 05") + b"\x00" * (24 - 6)
+
+MAC_MARKERS = [
+    b"\x48\x00\x00\x00\x00",
+]
+
+TRUEN_OUI = b"\x00\x1c\x63"
+
+
+@dataclass(frozen=True)
+class ParsedDiscoveryPacket:
+    ip: str
+    mac: str
+    mac12: str
+    model: str | None = None
+    firmware: str | None = None
+    lens: str | None = None
+    note: str | None = None
+
+
+def mac6_to_str(mac6: bytes) -> str:
+    return ":".join(f"{b:02X}" for b in mac6)
+
+
+def is_probable_unicast_mac(mac6: bytes) -> bool:
+    if len(mac6) != 6:
+        return False
+    if mac6 == b"\x00" * 6:
+        return False
+    if mac6[0] & 0x01:
+        return False
+    return True
+
+
+def is_discovery_response(pkt: bytes) -> bool:
+    return len(pkt) >= 4 and pkt.startswith(RSP_SIG)
+
+
+def extract_mac_by_marker(pkt: bytes) -> Optional[tuple[int, bytes, str]]:
+    best: Optional[tuple[int, bytes, str]] = None
+
+    for marker in MAC_MARKERS:
+        start = 0
+        while True:
+            idx = pkt.find(marker, start)
+            if idx == -1:
+                break
+
+            cand_offs = [idx + len(marker) - 1, idx + len(marker), idx + len(marker) + 1]
+
+            for mac_off in cand_offs:
+                if mac_off < 0 or mac_off + 6 > len(pkt):
+                    continue
+
+                mac6 = pkt[mac_off:mac_off + 6]
+                if not is_probable_unicast_mac(mac6):
+                    continue
+
+                why = f"marker:{marker.hex()}@{mac_off}"
+
+                if mac6.startswith(TRUEN_OUI):
+                    return mac_off, mac6, why
+
+                if best is None:
+                    best = (mac_off, mac6, why)
+
+            start = idx + 1
+
+    return best
+
+
+def extract_model_fw_after_mac(pkt: bytes, mac_off: int | None) -> tuple[str | None, str | None]:
+    if mac_off is None:
+        return None, None
+
+    start = mac_off + 6
+    search = pkt[start:start + 96]
+
+    runs: list[str] = []
+    buf = bytearray()
+
+    def flush() -> None:
+        nonlocal buf
+        if len(buf) >= 4:
+            try:
+                runs.append(buf.decode("ascii"))
+            except Exception:
+                pass
+        buf = bytearray()
+
+    for b in search:
+        if 0x20 <= b <= 0x7E:
+            buf.append(b)
+        else:
+            flush()
+    flush()
+
+    if not runs:
+        return None, None
+
+    model = runs[0]
+    fw = runs[1] if len(runs) >= 2 else None
+
+    def looks_fw(s: str) -> bool:
+        return bool(re.match(r"^[Vv]\d", s)) or ("." in s and any(c.isdigit() for c in s))
+
+    def looks_model(s: str) -> bool:
+        return ("-" in s and len(s) >= 6) or bool(re.match(r"^[A-Za-z]{1,4}[A-Za-z0-9\-]{4,}$", s))
+
+    if fw and looks_model(fw) and looks_fw(model):
+        model, fw = fw, model
+
+    if not looks_model(model):
+        for s in runs:
+            if looks_model(s):
+                model = s
+                break
+
+    if fw and not looks_fw(fw):
+        for s in runs:
+            if s != model and looks_fw(s):
+                fw = s
+                break
+
+    return model, fw
+
+
+def parse_discovery_packet(pkt: bytes, src_ip: str) -> ParsedDiscoveryPacket | None:
+    if not is_discovery_response(pkt):
+        return None
+
+    mac_found = extract_mac_by_marker(pkt)
+    if not mac_found:
+        return None
+
+    mac_off, mac6, mac_note = mac_found
+    mac = mac6_to_str(mac6)
+    mac12 = mac6.hex().upper().zfill(12)
+    model, firmware = extract_model_fw_after_mac(pkt, mac_off)
+    lens = str(len(pkt))
+
+    return ParsedDiscoveryPacket(
+        ip=src_ip,
+        mac=mac,
+        mac12=mac12,
+        model=model,
+        firmware=firmware,
+        lens=lens,
+        note=mac_note,
+    )
+
+################################################################################
+FILE: udp_discovery.py
+PATH: infra/discovery/udp_discovery.py
+EXT: .py
+################################################################################
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+
+from infra.discovery.network import (
+    compute_directed_broadcast,
+    get_local_ipv4,
+    open_udp_socket,
+    safe_close_socket,
+)
+from infra.discovery.packet_parser import REQ24, ParsedDiscoveryPacket, parse_discovery_packet
+
+
+DEFAULT_PORT = 64988
+LIMITED_BCAST = "255.255.255.255"
+
+
+@dataclass(frozen=True)
+class UdpDiscoveryDevice:
+    ip: str
+    mac: str
+    mac12: str
+    model: str
+    firmware: str
+    lens: str
+    note: str
+
+
+def _build_destinations(bind_ip: str | None, mask_bits: int, port: int) -> list[tuple[str, int]]:
+    dsts: list[tuple[str, int]] = [(LIMITED_BCAST, port)]
+
+    if bind_ip:
+        try:
+            dsts.append((compute_directed_broadcast(bind_ip, mask_bits), port))
+        except Exception:
+            pass
+
+    uniq: list[tuple[str, int]] = []
+    seen = set()
+    for d in dsts:
+        if d not in seen:
+            uniq.append(d)
+            seen.add(d)
+    return uniq
+
+
+def run_udp_discovery(
+    *,
+    bind_ip: str | None = None,
+    mask_bits: int = 24,
+    port: int = DEFAULT_PORT,
+    seconds: float = 4.0,
+    repeat: int = 4,
+    interval: float = 0.12,
+    ignore_self: bool = True,
+) -> tuple[str | None, list[UdpDiscoveryDevice]]:
+    bind_ip = bind_ip or get_local_ipv4()
+    sock = open_udp_socket("0.0.0.0", port, timeout=0.05)
+
+    found: dict[str, UdpDiscoveryDevice] = {}
+    dsts = _build_destinations(bind_ip, mask_bits, port)
+
+    try:
+        deadline = time.time() + max(0.5, float(seconds))
+
+        while time.time() < deadline:
+            for _ in range(max(1, int(repeat))):
+                for dst in dsts:
+                    sock.sendto(REQ24, dst)
+                time.sleep(max(0.01, float(interval)))
+
+            rx_end = time.time() + max(0.2, float(interval) * 3.0)
+            while time.time() < rx_end:
+                try:
+                    pkt, (src_ip, src_port) = sock.recvfrom(4096)
+                except TimeoutError:
+                    continue
+                except OSError:
+                    continue
+
+                if src_port != port:
+                    continue
+                if ignore_self and bind_ip and src_ip == bind_ip:
+                    continue
+
+                parsed = parse_discovery_packet(pkt, src_ip)
+                if parsed is None:
+                    continue
+
+                found[parsed.mac12] = UdpDiscoveryDevice(
+                    ip=parsed.ip,
+                    mac=parsed.mac,
+                    mac12=parsed.mac12,
+                    model=parsed.model or "-",
+                    firmware=parsed.firmware or "-",
+                    lens=parsed.lens or "-",
+                    note=parsed.note or "-",
+                )
+
+            time.sleep(0.02)
+
+        return bind_ip, list(found.values())
+
+    finally:
+        safe_close_socket(sock)
+
