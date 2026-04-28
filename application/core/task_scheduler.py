@@ -41,6 +41,7 @@ class TaskScheduler:
         self._queues: dict[TaskLane, list[_QueueItem]] = {lane: [] for lane in LANE_ORDER}
         self._sequence = itertools.count(1)
         self._lock = threading.RLock()
+        self._submitted_device_ips: set[str] = set()
 
     def enqueue(self, task: TaskSpec) -> None:
         due_at = float(task.due_at) if task.due_at is not None else 0.0
@@ -59,8 +60,20 @@ class TaskScheduler:
                 return sum(len(items) for items in self._queues.values())
             return len(self._queues[lane])
 
+    def mark_task_submitted(self, device_ip: str | None) -> None:
+        if not device_ip:
+            return
+        with self._lock:
+            self._submitted_device_ips.add(device_ip)
+
+    def mark_task_finished(self, device_ip: str | None) -> None:
+        if not device_ip:
+            return
+        with self._lock:
+            self._submitted_device_ips.discard(device_ip)
+
     def _has_pending_connect_for_device(self, device_ip: str) -> bool:
-        for lane, queue in self._queues.items():
+        for _lane, queue in self._queues.items():
             for item in queue:
                 task = item.task
                 if task.device_ip == device_ip and task.command == CommandKind.CONNECT:
@@ -92,46 +105,93 @@ class TaskScheduler:
 
         return self._has_pending_connect_for_device(task.device_ip)
 
-    def dispatch_once(self) -> bool:
+    def _pop_next_ready_task_for_lane(self, lane: TaskLane, now: float) -> TaskSpec | None:
+        queue = self._queues[lane]
+
+        while queue:
+            item = queue[0]
+            if item.due_at and item.due_at > now:
+                return None
+
+            task = item.task
+            if not task.device_ip:
+                heapq.heappop(queue)
+                continue
+
+            actor = self.registry.get_actor(task.device_ip)
+            if actor is None:
+                heapq.heappop(queue)
+                raise AppError(kind="state", message="actor not found", detail=task.device_ip)
+
+            if task.device_ip in self._submitted_device_ips:
+                return None
+
+            if self._is_blocked_by_connect_prerequisite(task):
+                return None
+
+            if not actor.can_accept_task(task):
+                return None
+
+            heapq.heappop(queue)
+            self._submitted_device_ips.add(task.device_ip)
+            return task
+
+        return None
+
+    def dispatch_ready_tasks(
+        self,
+        *,
+        connect_limit: int = 8,
+        other_limit: int = 4,
+    ) -> list[TaskSpec]:
         now = time.time()
-        selected_task: TaskSpec | None = None
+        selected: list[TaskSpec] = []
 
         with self._lock:
-            for lane in LANE_ORDER:
-                queue = self._queues[lane]
-                if not queue:
-                    continue
+            connect_count = 0
+            other_count = 0
 
-                item = queue[0]
-                if item.due_at and item.due_at > now:
-                    continue
+            while True:
+                picked_any = False
 
-                task = item.task
-                if not task.device_ip:
-                    heapq.heappop(queue)
-                    continue
+                for lane in LANE_ORDER:
+                    if lane == TaskLane.CONNECT and connect_count >= connect_limit:
+                        continue
+                    if lane != TaskLane.CONNECT and other_count >= other_limit:
+                        continue
 
-                actor = self.registry.get_actor(task.device_ip)
-                if actor is None:
-                    heapq.heappop(queue)
-                    raise AppError(kind="state", message="actor not found", detail=task.device_ip)
+                    task = self._pop_next_ready_task_for_lane(lane, now)
+                    if task is None:
+                        continue
 
-                if self._is_blocked_by_connect_prerequisite(task):
-                    continue
+                    selected.append(task)
+                    picked_any = True
 
-                if not actor.can_accept_task(task):
-                    continue
+                    if lane == TaskLane.CONNECT:
+                        connect_count += 1
+                    else:
+                        other_count += 1
 
-                heapq.heappop(queue)
-                selected_task = task
+                    # lane priority를 유지하기 위해 한 번에 하나씩만 뽑고 다시 처음부터 본다.
+                    break
+
+                if not picked_any:
+                    break
+
+        return selected
+
+    def dispatch_once(self) -> bool:
+        tasks = self.dispatch_ready_tasks(connect_limit=1, other_limit=1)
+        return bool(tasks)
+
+    def run_until_idle(self, max_steps: int = 1000) -> int:
+        steps = 0
+        while steps < max_steps:
+            tasks = self.dispatch_ready_tasks(connect_limit=1, other_limit=1)
+            if not tasks:
                 break
-
-        if selected_task is None:
-            return False
-
-        actor = self.registry.get_actor(selected_task.device_ip)
-        if actor is None:
-            raise AppError(kind="state", message="actor missing before execution", detail=selected_task.device_ip)
-
-        actor.execute_task(selected_task)
-        return True
+            # 이전 Step unit test 호환용: 여기서는 실행하지 않고 "dispatch 가능 여부"만 센다.
+            for task in tasks:
+                self.mark_task_finished(task.device_ip)
+            steps += len(tasks)
+        return steps

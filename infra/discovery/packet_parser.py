@@ -14,6 +14,8 @@ MAC_MARKERS = [
 
 TRUEN_OUI = b"\x00\x1c\x63"
 
+ASCII_WINDOW_LEN = 192
+
 
 @dataclass(frozen=True)
 class ParsedDiscoveryPacket:
@@ -95,7 +97,15 @@ def extract_mac_by_marker(pkt: bytes) -> Optional[tuple[int, bytes, str]]:
     return best
 
 
-def _ascii_runs(blob: bytes, *, min_len: int = 4) -> list[str]:
+def _clean_ascii_token(text: str | None) -> str | None:
+    if text is None:
+        return None
+    s = "".join(ch for ch in str(text) if 0x20 <= ord(ch) <= 0x7E)
+    s = " ".join(s.split()).strip().strip("\x00")
+    return s or None
+
+
+def _collect_ascii_tokens(blob: bytes, *, min_len: int = 1) -> list[str]:
     runs: list[str] = []
     buf = bytearray()
 
@@ -103,9 +113,10 @@ def _ascii_runs(blob: bytes, *, min_len: int = 4) -> list[str]:
         nonlocal buf
         if len(buf) >= min_len:
             try:
-                text = buf.decode("ascii", errors="ignore").strip()
-                if text:
-                    runs.append(text)
+                raw = buf.decode("ascii", errors="ignore").strip()
+                cleaned = _clean_ascii_token(raw)
+                if cleaned:
+                    runs.append(cleaned)
             except Exception:
                 pass
         buf = bytearray()
@@ -116,14 +127,97 @@ def _ascii_runs(blob: bytes, *, min_len: int = 4) -> list[str]:
         else:
             flush()
     flush()
+
     return runs
 
 
-def _clean_text(value: str | None) -> str | None:
-    if value is None:
+def _looks_fw(token: str) -> bool:
+    s = _clean_ascii_token(token)
+    if not s:
+        return False
+    return bool(re.match(r"^[Vv]\d[0-9A-Za-z._\-]*$", s))
+
+
+def _looks_model(token: str) -> bool:
+    s = _clean_ascii_token(token)
+    if not s:
+        return False
+    return bool(re.match(r"^[A-Z][A-Z0-9]{1,10}-[A-Z0-9]{4,20}$", s))
+
+
+def _sanitize_model_token(token: str | None) -> str | None:
+    """
+    discovery 패킷 모델명은 현재 현장 기준으로
+    앞에 불필요한 1글자가 더 붙는 경우가 있다.
+
+    규칙:
+    - 앞 1글자를 제거한 결과가 T계열 모델(TCAM / TN / TX / TA...)이면 제거값 사용
+    - 아니면 OEM 모델일 수 있으므로 원문 유지
+    """
+    s = _clean_ascii_token(token)
+    if not s:
         return None
-    text = " ".join(str(value).split()).strip().strip("\x00")
-    return text or None
+
+    # 앞쪽 비정상 잡문자 제거
+    while s and not s[0].isalnum():
+        s = s[1:]
+
+    if not s:
+        return None
+
+    # 모델 패턴 추출
+    m = re.search(r"[A-Z][A-Z0-9]{1,12}-[A-Z0-9]{4,24}", s)
+    if m:
+        s = m.group(0)
+
+    # 앞 1글자를 제거했을 때 T계열 모델이면 그 값을 사용
+    if len(s) > 1:
+        trimmed = s[1:].strip()
+        if re.match(r"^T[A-Z0-9]{1,12}-[A-Z0-9]{4,24}$", trimmed):
+            return trimmed
+
+    # 그 외는 OEM 포함 원문 그대로 유지
+    return s or None
+
+
+def _extract_model_and_fw(tokens: list[str]) -> tuple[str | None, str | None]:
+    if not tokens:
+        return None, None
+
+    cleaned = [_clean_ascii_token(t) for t in tokens]
+    cleaned = [t for t in cleaned if t]
+
+    if not cleaned:
+        return None, None
+
+    fw_idx = -1
+    fw: str | None = None
+
+    for idx, token in enumerate(cleaned):
+        if _looks_fw(token):
+            fw_idx = idx
+            fw = token
+            break
+
+    model: str | None = None
+
+    # 1순위: 펌웨어 바로 앞 token
+    if fw_idx > 0:
+        model = _sanitize_model_token(cleaned[fw_idx - 1])
+
+    # 2순위: 하이픈 포함 token 중 모델 패턴 후보
+    if not model:
+        for token in cleaned:
+            normalized = _sanitize_model_token(token)
+            if normalized and _looks_model(normalized):
+                model = normalized
+                break
+
+    # 3순위: 마지막 fallback
+    if not model and cleaned:
+        model = _sanitize_model_token(cleaned[0])
+
+    return model, fw
 
 
 def extract_model_fw_after_mac(pkt: bytes, mac_off: int | None) -> tuple[str | None, str | None]:
@@ -131,38 +225,12 @@ def extract_model_fw_after_mac(pkt: bytes, mac_off: int | None) -> tuple[str | N
         return None, None
 
     start = mac_off + 6
-    search = pkt[start : start + 128]
-    runs = [_clean_text(x) for x in _ascii_runs(search, min_len=4)]
-    runs = [x for x in runs if x]
+    search = pkt[start : start + ASCII_WINDOW_LEN]
 
-    if not runs:
-        return None, None
+    tokens = _collect_ascii_tokens(search, min_len=1)
+    model, fw = _extract_model_and_fw(tokens)
 
-    model = runs[0]
-    firmware = runs[1] if len(runs) >= 2 else None
-
-    def looks_fw(s: str) -> bool:
-        return bool(re.match(r"^[Vv]\d", s)) or ("." in s and any(c.isdigit() for c in s))
-
-    def looks_model(s: str) -> bool:
-        return ("-" in s and len(s) >= 6) or bool(re.match(r"^[A-Za-z]{1,4}[A-Za-z0-9\-]{4,}$", s))
-
-    if firmware and looks_model(firmware) and looks_fw(model):
-        model, firmware = firmware, model
-
-    if model and not looks_model(model):
-        for item in runs:
-            if looks_model(item):
-                model = item
-                break
-
-    if firmware and not looks_fw(firmware):
-        for item in runs:
-            if item != model and looks_fw(item):
-                firmware = item
-                break
-
-    return _clean_text(model), _clean_text(firmware)
+    return model, fw
 
 
 def parse_discovery_packet(pkt: bytes, src_ip: str) -> ParsedDiscoveryPacket | None:

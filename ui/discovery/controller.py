@@ -130,14 +130,14 @@ class ResetBatchWorker(QObject):
 
 class DiscoveryController:
     def __init__(
-        self,
-        *,
-        window: DiscoveryWindow,
-        on_rows_added: Callable[[list[dict]], None],
-        on_log: Callable[[str], None] | None = None,
-        discovery_service: DiscoveryService | None = None,
-        setip_service: SetIpService | None = None,
-        reset_service: ResetService | None = None,
+            self,
+            *,
+            window: DiscoveryWindow,
+            on_rows_added: Callable[[list[dict]], None],
+            on_log: Callable[[str], None] | None = None,
+            discovery_service: DiscoveryService | None = None,
+            setip_service: SetIpService | None = None,
+            reset_service: ResetService | None = None,
     ) -> None:
         self.window = window
         self.on_rows_added = on_rows_added
@@ -153,6 +153,10 @@ class DiscoveryController:
 
         self._selection_order_counter = 0
         self._prev_selected_map: dict[str, bool] = {}
+
+        # discovery에서 실제 성공한 NIC / mask 정보를 저장
+        self._last_bind_ip: str | None = None
+        self._last_mask_bits: int = 24
 
     # ---------------------------------------------------------
     # bind
@@ -242,7 +246,6 @@ class DiscoveryController:
 
     def _recompact_selection_order(self, rows: list[DiscoveryRow]) -> list[DiscoveryRow]:
         selected = [row for row in rows if row.selected]
-        unselected = [row for row in rows if not row.selected]
 
         if self.window.order_mode() == "mac":
             ordered_selected = sorted(selected, key=self._sort_key_mac)
@@ -335,7 +338,8 @@ class DiscoveryController:
             self._sync_previous_selected_map(recomputed)
             return
 
-        self._sync_previous_selected_map(current_selected_map_to_rows(rows))
+        # 중요: dict가 아니라 rows 그대로 넘겨야 한다
+        self._sync_previous_selected_map(rows)
 
     def _on_select_all_toggled(self, selected: bool) -> None:
         rows = self._rows()
@@ -403,8 +407,10 @@ class DiscoveryController:
     def _on_scan_finished(self, bind_ip: str | None, rows: list[DiscoveryRow], stopped: bool) -> None:
         self.window.set_bind_ip(bind_ip)
 
-        # 기본: 검색 결과는 전부 체크 상태로 보여주되,
-        # 순번은 MAC 오름차순 기준으로 매긴다.
+        # discovery 성공 NIC를 이후 setip/reset에서 재사용
+        self._last_bind_ip = bind_ip
+        self._last_mask_bits = 24
+
         normalized = rows[:]
         normalized = self._apply_mac_order(normalized)
 
@@ -506,12 +512,12 @@ class DiscoveryController:
                 )
                 for row in ordered
             ],
-            bind_ip=None,
-            mask_bits=24,
+            bind_ip=self._last_bind_ip,
+            mask_bits=self._last_mask_bits,
             port=64988,
-            retries=2,
-            ack_wait_sec=1.0,
-            confirm_announce_sec=0.8,
+            retries=1,
+            ack_wait_sec=0.35,
+            confirm_announce_sec=0.0,
         )
 
         self._thread = QThread()
@@ -528,7 +534,6 @@ class DiscoveryController:
         self._worker.failed.connect(self._thread.quit)
         self._thread.finished.connect(self._cleanup_worker)
 
-        # 상태를 먼저 "변경 중"으로
         busy_rows: list[DiscoveryRow] = []
         target_mac12 = {(row.mac12 or "").strip().upper() for row in ordered}
         for row in rows:
@@ -542,7 +547,10 @@ class DiscoveryController:
         self.window.set_status_text("IP 변경 실행 중...")
         self._set_busy("setip")
         self._thread.start()
-        self._log(f"IP 변경 실행: {len(ordered)}대")
+        self._log(
+            f"IP 변경 실행: {len(ordered)}대 "
+            f"(bind_ip={self._last_bind_ip or '-'}, mask_bits={self._last_mask_bits})"
+        )
 
     def _on_setip_finished(self, result) -> None:
         rows = self._rows()
@@ -560,15 +568,18 @@ class DiscoveryController:
                 updated.append(row)
                 continue
 
-            if bool(getattr(item, "ok", False)):
+            item_ok = bool(getattr(item, "ok", False))
+            ack_seen = bool(getattr(item, "ack_seen", False))
+
+            if item_ok and ack_seen:
                 ok_count += 1
-                new_ip = (getattr(item, "announced_ip", None) or row.new_ip or row.ip).strip()
+                # 여기서는 현재 IP를 즉시 바꾸지 않는다.
+                # 실제 반영은 2~5초 뒤 재검색에서 확인한다.
                 updated.append(
                     replace(
                         row,
-                        ip=new_ip,
-                        status="IP 변경 완료",
-                        note="IP 변경 성공",
+                        status="IP 변경 요청 완료",
+                        note="2~5초 후 다시 검색",
                     )
                 )
             else:
@@ -585,8 +596,8 @@ class DiscoveryController:
         self._apply_rows(updated)
         self._sync_previous_selected_map(updated)
 
-        self.window.set_status_text("IP 변경 완료")
-        self._log(f"IP 변경 완료: 성공 {ok_count}대 / 실패 {fail_count}대")
+        self.window.set_status_text("IP 변경 요청 완료")
+        self._log(f"IP 변경 요청 완료: 성공 {ok_count}대 / 실패 {fail_count}대")
 
     def _on_setip_failed(self, message: str) -> None:
         self.window.set_status_text("IP 변경 실패")
@@ -618,17 +629,17 @@ class DiscoveryController:
                 )
                 for row in selected
             ],
-            bind_ip=None,
-            mask_bits=24,
+            bind_ip=self._last_bind_ip,
+            mask_bits=self._last_mask_bits,
             port=64988,
-            scan_seconds=2.0,
-            seed_sweep=120,
-            write_seq=3,
-            write_gap=0.01,
-            ack_wait_sec=1.0,
+            scan_seconds=12.0,
+            seed_sweep=320,
+            write_seq=4,
+            write_gap=0.012,
+            ack_wait_sec=1.8,
             ignore_self=True,
             bf96_step=1,
-            ack_any_ip=False,
+            ack_any_ip=True,
         )
 
         self._thread = QThread()
@@ -658,7 +669,10 @@ class DiscoveryController:
         self.window.set_status_text("선택 초기화 실행 중...")
         self._set_busy("reset")
         self._thread.start()
-        self._log(f"선택 초기화 실행: {len(selected)}대")
+        self._log(
+            f"선택 초기화 실행: {len(selected)}대 "
+            f"(bind_ip={self._last_bind_ip or '-'}, mask_bits={self._last_mask_bits})"
+        )
 
     def _on_reset_finished(self, result) -> None:
         rows = self._rows()
@@ -751,10 +765,3 @@ class DiscoveryController:
 
         self.on_rows_added(self._to_main_rows(rows))
         self._log(f"전체 추가: {len(rows)}대")
-
-
-def current_selected_map_to_rows(rows: list[DiscoveryRow]) -> dict[str, bool]:
-    return {
-        (row.mac12 or "").strip().upper(): bool(row.selected)
-        for row in rows
-    }

@@ -335,13 +335,18 @@ class MainWindowController:
             self._show_error("Connect", "현재 비밀번호를 입력하세요.")
             return
 
+        requests: list[tuple[str, Phase1Request]] = []
         for ip in target_ips:
             request = self._build_phase1_request(ip)
-            self.supervisor.enqueue_connect(ip, request)
+            requests.append((ip, request))
             self._append_log(
-                f"connect queued: ip={ip} port={request.port} user={request.username} "
+                f"connect batch item: ip={ip} port={request.port} user={request.username} "
                 f"pw={request.password} target={request.target_password} tls={request.verify_tls}"
             )
+
+        batch_id = self.supervisor.enqueue_connect_batch(requests, auto_info=True)
+        self._append_log(f"connect batch queued: batch_id={batch_id} count={len(requests)}")
+        self._append_result(f"Connect 시작: {len(requests)}대 / batch={batch_id}")
 
     def _on_load_info_clicked(self) -> None:
         target_ips = self._current_target_ips()

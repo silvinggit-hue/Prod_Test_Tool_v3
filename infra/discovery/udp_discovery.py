@@ -12,7 +12,7 @@ from infra.discovery.network import (
     safe_close_socket,
     send_udp_many,
 )
-from infra.discovery.packet_parser import REQ24, ParsedDiscoveryPacket, parse_discovery_packet
+from infra.discovery.packet_parser import ParsedDiscoveryPacket, REQ24, parse_discovery_packet
 
 
 DEFAULT_PORT = 64988
@@ -32,9 +32,13 @@ class UdpDiscoveryDevice:
 def _sort_devices(devices: list[UdpDiscoveryDevice]) -> list[UdpDiscoveryDevice]:
     def sort_key(item: UdpDiscoveryDevice):
         try:
-            return (0, int(ipaddress.ip_address(item.ip)))
+            return (
+                0,
+                int(ipaddress.ip_address(item.ip)),
+                (item.mac12 or "").strip().upper(),
+            )
         except Exception:
-            return (1, item.ip)
+            return (1, item.ip, (item.mac12 or "").strip().upper())
 
     return sorted(devices, key=sort_key)
 
@@ -56,8 +60,10 @@ def run_udp_discovery(
     destinations = build_broadcast_destinations(bind_ip=bind_ip, mask_bits=mask_bits, port=port)
     sock = open_udp_socket("0.0.0.0", port, timeout=0.05)
 
+    # 핵심:
+    # discovery 단계에서는 IP가 같아도 MAC이 다르면 다른 장비다.
+    # 따라서 dedupe는 MAC 기준만 한다.
     found_by_mac: dict[str, UdpDiscoveryDevice] = {}
-    found_by_ip: dict[str, str] = {}
 
     started_at = time.time()
     deadline = started_at + max(0.5, float(seconds))
@@ -104,11 +110,6 @@ def run_udp_discovery(
 
                 last_packet_at = time.time()
 
-                existing_mac = found_by_ip.get(parsed.ip)
-                if existing_mac and existing_mac != parsed.mac12:
-                    # 같은 IP에서 MAC이 바뀌는 이상 케이스는 새 응답을 우선 반영
-                    found_by_mac.pop(existing_mac, None)
-
                 device = UdpDiscoveryDevice(
                     ip=parsed.ip,
                     mac=parsed.mac,
@@ -118,8 +119,10 @@ def run_udp_discovery(
                     lens=parsed.lens or "-",
                     note=parsed.note or "-",
                 )
-                found_by_mac[device.mac12] = device
-                found_by_ip[device.ip] = device.mac12
+
+                # 같은 MAC이면 최신 응답으로 갱신
+                # 같은 IP라도 MAC이 다르면 별도 장비로 유지
+                found_by_mac[(device.mac12 or "").strip().upper()] = device
 
             elapsed = time.time() - started_at
             if elapsed >= max(0.0, float(min_wait)) and found_by_mac:
