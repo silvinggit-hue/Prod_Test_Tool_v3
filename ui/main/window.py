@@ -14,6 +14,8 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from PyQt5.QtGui import QIcon
+from config.constants import APP_ICON_PATH
 
 from config.constants import APP_DISPLAY_NAME
 from ui.delegates.led_delegate import LedBarDelegate
@@ -31,6 +33,8 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(APP_DISPLAY_NAME)
+        if APP_ICON_PATH.exists():
+            self.setWindowIcon(QIcon(str(APP_ICON_PATH)))
         self.resize(1600, 950)
 
         self._build_toolbar()
@@ -157,8 +161,12 @@ class MainWindow(QMainWindow):
 
         splitter.addWidget(left_widget)
         splitter.addWidget(right_widget)
-        splitter.setStretchFactor(0, 5)
-        splitter.setStretchFactor(1, 2)
+
+        right_widget.setMinimumWidth(280)
+
+        splitter.setStretchFactor(0, 7)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([1350, 280])
 
         root.addWidget(splitter, 1)
         root.addWidget(self.main_status_bar, 0)

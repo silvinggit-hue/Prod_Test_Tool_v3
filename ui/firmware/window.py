@@ -18,6 +18,8 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from PyQt5.QtGui import QIcon
+from config.constants import APP_ICON_PATH
 
 from domain.models.firmware_models import FirmwareBatchSnapshot
 from ui.firmware.table_model import FirmwareTableModel
@@ -29,6 +31,8 @@ class FirmwareWindow(QMainWindow):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Firmware")
+        if APP_ICON_PATH.exists():
+            self.setWindowIcon(QIcon(str(APP_ICON_PATH)))
         self.resize(1200, 780)
 
         self._build_ui()

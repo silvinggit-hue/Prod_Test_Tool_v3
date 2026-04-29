@@ -19,6 +19,8 @@ from PyQt5.QtWidgets import (
     QTableView,
     QVBoxLayout,
 )
+from PyQt5.QtGui import QIcon
+from config.constants import APP_ICON_PATH
 
 
 @dataclass(frozen=True)
@@ -249,6 +251,8 @@ class DiscoveryWindow(QDialog):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("장비 검색 / IP 변경")
+        if APP_ICON_PATH.exists():
+            self.setWindowIcon(QIcon(str(APP_ICON_PATH)))
         self.resize(1180, 650)
         self._build_ui()
 

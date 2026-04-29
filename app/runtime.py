@@ -9,7 +9,9 @@ from pathlib import Path
 from typing import Sequence
 
 from PyQt5.QtWidgets import QApplication
+from PyQt5.QtGui import QIcon
 
+from config.constants import APP_DISPLAY_NAME, APP_NAME, APP_ORG_NAME, APP_ICON_PATH
 from app.bootstrap import Bootstrap, BootstrapResult
 from common.logging.logging_config import setup_logging
 from config.constants import APP_DISPLAY_NAME, APP_NAME, APP_ORG_NAME
@@ -66,6 +68,10 @@ def create_application(argv: Sequence[str] | None = None) -> QApplication:
     app.setApplicationDisplayName(APP_DISPLAY_NAME)
     app.setOrganizationName(APP_ORG_NAME)
     app.setQuitOnLastWindowClosed(True)
+
+    if APP_ICON_PATH.exists():
+        app.setWindowIcon(QIcon(str(APP_ICON_PATH)))
+
     return app
 
 

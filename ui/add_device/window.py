@@ -14,6 +14,8 @@ from PyQt5.QtWidgets import (
     QSpinBox,
     QVBoxLayout,
 )
+from PyQt5.QtGui import QIcon
+from config.constants import APP_ICON_PATH
 
 
 class AddDeviceWindow(QDialog):
@@ -22,6 +24,8 @@ class AddDeviceWindow(QDialog):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Add Device")
+        if APP_ICON_PATH.exists():
+            self.setWindowIcon(QIcon(str(APP_ICON_PATH)))
         self.resize(420, 220)
         self._build_ui()
 

@@ -11,6 +11,8 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from PyQt5.QtGui import QIcon
+from config.constants import APP_ICON_PATH
 
 from application.core.video_coordinator import VideoStreamItem
 from ui.video.tile_widget import VideoTileWidget
@@ -25,6 +27,8 @@ class VideoWindow(QMainWindow):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Video")
+        if APP_ICON_PATH.exists():
+            self.setWindowIcon(QIcon(str(APP_ICON_PATH)))
         self.resize(1500, 900)
 
         self._tiles: list[VideoTileWidget] = []
