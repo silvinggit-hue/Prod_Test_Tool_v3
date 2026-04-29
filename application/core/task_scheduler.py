@@ -121,7 +121,7 @@ class TaskScheduler:
             actor = self.registry.get_actor(task.device_ip)
             if actor is None:
                 heapq.heappop(queue)
-                raise AppError(kind="state", message="actor not found", detail=task.device_ip)
+                continue
 
             if task.device_ip in self._submitted_device_ips:
                 return None

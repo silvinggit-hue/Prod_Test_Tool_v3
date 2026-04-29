@@ -7,6 +7,7 @@ from PyQt5.QtCore import QItemSelection, QItemSelectionModel, QModelIndex, QSign
 from PyQt5.QtWidgets import QMessageBox
 
 from application.core.app_supervisor import AppSupervisor
+from application.firmware.firmware_batch_supervisor import FirmwareBatchSupervisor
 from domain.enums.device import DeviceFlavor, DeviceState
 from domain.models.phase1 import Phase1Request
 from ui.add_device.controller import AddDeviceController
@@ -14,6 +15,10 @@ from ui.add_device.window import AddDeviceWindow
 from ui.discovery.controller import DiscoveryController
 from ui.discovery.window import DiscoveryWindow
 from ui.main.window import MainWindow
+from ui.video.controller import VideoWindowController
+from ui.video.window import VideoWindow
+from ui.firmware.controller import FirmwareWindowController
+from ui.firmware.window import FirmwareWindow
 
 
 class MainWindowController:
@@ -54,12 +59,19 @@ class MainWindowController:
         self._add_device_controller: AddDeviceController | None = None
         self._discovery_window: DiscoveryWindow | None = None
         self._discovery_controller: DiscoveryController | None = None
+        self._video_window: VideoWindow | None = None
+        self._video_controller: VideoWindowController | None = None
         self._ui_timer: QTimer | None = None
+        self._firmware_window: FirmwareWindow | None = None
+        self._firmware_controller: FirmwareWindowController | None = None
+        self._firmware_supervisor: FirmwareBatchSupervisor | None = None
 
     def bind(self) -> None:
         self.window.add_device_action.triggered.connect(self._on_open_add_device_window)
         self.window.discovery_action.triggered.connect(self._on_open_discovery_window)
-        self.window.clear_selection_action.triggered.connect(self._on_clear_selection_clicked)
+        self.window.video_action.triggered.connect(self._on_open_video_window)
+        self.window.firmware_action.triggered.connect(self._on_open_firmware_window)
+        self.window.delete_rows_action.triggered.connect(self._on_delete_rows_clicked)
 
         self.window.connect_panel.connect_selected_button.clicked.connect(self._on_connect_selected_clicked)
         self.window.connect_panel.disconnect_selected_button.clicked.connect(self._on_disconnect_selected_clicked)
@@ -383,6 +395,20 @@ class MainWindowController:
             )
             self._discovery_controller.bind()
 
+    def _ensure_video_window(self) -> None:
+        if self._video_window is None:
+            self._video_window = VideoWindow(self.window)
+            self._video_controller = VideoWindowController(
+                window=self._video_window,
+                supervisor=self.supervisor,
+                checked_ips_provider=self._checked_ips,
+                selected_ips_provider=self._selected_ips_from_table,
+                focused_ip_provider=self._focused_ip_from_table,
+                on_log=self._append_log,
+                on_result=self._append_result,
+            )
+            self._video_controller.bind()
+
     def _on_open_add_device_window(self) -> None:
         self._ensure_add_device_window()
         assert self._add_device_window is not None
@@ -397,9 +423,71 @@ class MainWindowController:
         self._discovery_window.raise_()
         self._discovery_window.activateWindow()
 
+    def _on_open_video_window(self) -> None:
+        self._ensure_video_window()
+        assert self._video_controller is not None
+        self._video_controller.open_window()
+
+    def _ensure_firmware_window(self) -> None:
+        if self._firmware_window is None:
+            self._firmware_window = FirmwareWindow(self.window)
+            self._firmware_supervisor = FirmwareBatchSupervisor()
+            self._firmware_controller = FirmwareWindowController(
+                window=self._firmware_window,
+                firmware_supervisor=self._firmware_supervisor,
+                checked_ips_provider=self._checked_ips,
+                selected_ips_provider=self._selected_ips_from_table,
+                focused_ip_provider=self._focused_ip_from_table,
+                snapshot_provider=self.supervisor.get_snapshot,
+                refresh_main_callback=self.refresh_all,
+                enqueue_info_load_callback=self.supervisor.enqueue_info_load,
+                on_log=self._append_log,
+                on_result=self._append_result,
+            )
+            self._firmware_controller.bind()
+
+    def _on_open_firmware_window(self) -> None:
+        self._ensure_firmware_window()
+        assert self._firmware_controller is not None
+        self._firmware_controller.open_window()
+
     def _on_clear_selection_clicked(self) -> None:
         self.supervisor.registry.clear_selection()
         self.supervisor.set_focused(None)
+        self.refresh_all()
+
+    def _delete_target_ips(self) -> list[str]:
+        checked_ips = self._checked_ips()
+        if checked_ips:
+            return checked_ips
+
+        selected_ips = self._selected_ips_from_table()
+        if selected_ips:
+            return selected_ips
+
+        focused_ip = self._focused_ip_from_table()
+        if focused_ip:
+            return [focused_ip]
+
+        return []
+
+    def _on_delete_rows_clicked(self) -> None:
+        target_ips = self._delete_target_ips()
+        if not target_ips:
+            self._show_error("행 삭제", "삭제할 장비가 없습니다.")
+            return
+
+        if QMessageBox.question(
+                self.window,
+                "행 삭제",
+                f"선택한 장비 {len(target_ips)}대를 목록에서 삭제하시겠습니까?",
+        ) != QMessageBox.Yes:
+            return
+
+        removed_count = self.supervisor.remove_devices(target_ips)
+
+        self._append_log(f"rows deleted: {removed_count}")
+        self._append_result(f"행 삭제 완료: {removed_count}대")
         self.refresh_all()
 
     def _on_checkbox_toggled(self, ip: str, checked: bool) -> None:

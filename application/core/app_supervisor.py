@@ -241,7 +241,11 @@ class AppSupervisor:
                 if actor is not None and hasattr(actor, "has_session") and not actor.has_session():
                     continue
 
+                # 1) 제품 정보 다시 읽기
                 self.enqueue_info_load(ip)
+
+                # 2) 상태 poll도 같이 수행
+                self.enqueue_status_poll(ip, hot=True)
 
     def add_device(self, ip: str, *, port: int = 0, note: str = "") -> None:
         self.registry.ensure_device(ip, port=port, note=note)
@@ -363,3 +367,23 @@ class AppSupervisor:
             firmware_window_open=False,
             video_window_open=False,
         )
+
+    def remove_device(self, ip: str) -> bool:
+        actor = self.registry.get_actor(ip)
+        if actor is not None and hasattr(actor, "disconnect"):
+            try:
+                actor.disconnect(reason="행 삭제")
+            except Exception:
+                pass
+
+        removed = self.registry.remove_device(ip)
+        if removed:
+            self.ui_update_bus.mark_app_dirty("devices")
+        return removed
+
+    def remove_devices(self, ips: list[str]) -> int:
+        removed_count = 0
+        for ip in list(dict.fromkeys(ips)):
+            if self.remove_device(ip):
+                removed_count += 1
+        return removed_count

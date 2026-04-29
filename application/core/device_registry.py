@@ -183,3 +183,22 @@ class DeviceRegistry:
             firmware_window_open=firmware_window_open,
             video_window_open=video_window_open,
         )
+
+    def remove_device(self, ip: str) -> bool:
+        with self._lock:
+            existed = ip in self.snapshots_by_ip or ip in self.actors_by_ip
+            if not existed:
+                return False
+
+            self.snapshots_by_ip.pop(ip, None)
+            self.actors_by_ip.pop(ip, None)
+
+            if ip in self.ordered_ips:
+                self.ordered_ips = [item for item in self.ordered_ips if item != ip]
+
+            self.selected_ips.discard(ip)
+
+            if self.focused_ip == ip:
+                self.focused_ip = None
+
+            return True

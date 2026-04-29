@@ -461,7 +461,7 @@ class ControlPanel(QGroupBox):
         board_hex = boardid_to_hex(board_id)
         group_name = resolve_board_input_group(board_id)
 
-        self.video_input_context_label.setText(
+        self.video_input_target_label.setText(
             f"{model} / 보드 {board_hex} / 그룹 {group_name}"
         )
 

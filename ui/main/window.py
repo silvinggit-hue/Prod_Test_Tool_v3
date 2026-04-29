@@ -5,7 +5,6 @@ from PyQt5.QtWidgets import (
     QAbstractItemView,
     QAction,
     QHeaderView,
-    QHBoxLayout,
     QMainWindow,
     QScrollArea,
     QSplitter,
@@ -44,14 +43,18 @@ class MainWindow(QMainWindow):
         self.toolbar.setMovable(False)
         self.addToolBar(self.toolbar)
 
-        self.add_device_action = QAction("Add Device", self)
-        self.discovery_action = QAction("IP Discovery", self)
-        self.clear_selection_action = QAction("Clear Selection", self)
+        self.add_device_action = QAction("장비 추가", self)
+        self.discovery_action = QAction("장비 탐색", self)
+        self.video_action = QAction("Video", self)
+        self.firmware_action = QAction("Firmware", self)
+        self.delete_rows_action = QAction("장비 삭제", self)
 
         self.toolbar.addAction(self.add_device_action)
         self.toolbar.addAction(self.discovery_action)
+        self.toolbar.addAction(self.video_action)
+        self.toolbar.addAction(self.firmware_action)
         self.toolbar.addSeparator()
-        self.toolbar.addAction(self.clear_selection_action)
+        self.toolbar.addAction(self.delete_rows_action)
 
     def _build_table(self) -> None:
         self.device_table_model = DeviceTableModel()
@@ -101,12 +104,11 @@ class MainWindow(QMainWindow):
         self.main_status_bar = MainStatusBarWidget()
 
         self.right_tabs = QTabWidget()
-        self.right_tabs.setDocumentMode(True)
 
         self.system_tab = QWidget()
         self.system_tab_layout = QVBoxLayout(self.system_tab)
         self.system_tab_layout.setContentsMargins(0, 0, 0, 0)
-        self.system_tab_layout.setSpacing(4)
+        self.system_tab_layout.setSpacing(10)
         self.system_tab_layout.addWidget(self.info_panel)
         self.system_tab_layout.addWidget(self.status_panel)
         self.system_tab_layout.addStretch(1)
@@ -125,8 +127,8 @@ class MainWindow(QMainWindow):
         self.control_scroll.setWidgetResizable(True)
         self.control_scroll.setWidget(self.control_tab)
 
-        self.right_tabs.addTab(self.system_scroll, "System")
-        self.right_tabs.addTab(self.control_scroll, "Control")
+        self.right_tabs.addTab(self.system_scroll, "장비 정보")
+        self.right_tabs.addTab(self.control_scroll, "장비 제어")
 
     def _build_layout(self) -> None:
         central = QWidget()
@@ -137,43 +139,29 @@ class MainWindow(QMainWindow):
         root.setSpacing(8)
 
         splitter = QSplitter(Qt.Horizontal)
-        splitter.setChildrenCollapsible(False)
-        splitter.setHandleWidth(6)
 
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
         left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(0)
+        left_layout.setSpacing(8)
         left_layout.addWidget(self.device_table, 1)
+        left_layout.addWidget(self.result_panel, 0)
+        left_layout.addWidget(self.log_panel, 0)
 
         right_widget = QWidget()
-        right_widget.setMinimumWidth(390)
-        right_widget.setMaximumWidth(390)
-
         right_layout = QVBoxLayout(right_widget)
         right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(6)
+        right_layout.setSpacing(8)
         right_layout.addWidget(self.connect_panel, 0)
         right_layout.addWidget(self.right_tabs, 1)
 
-        right_bottom = QWidget()
-        right_bottom_layout = QHBoxLayout(right_bottom)
-        right_bottom_layout.setContentsMargins(0, 2, 0, 0)
-        right_bottom_layout.setSpacing(6)
-        right_bottom_layout.addWidget(self.result_panel, 1)
-        right_bottom_layout.addWidget(self.log_panel, 1)
-
-        right_layout.addWidget(right_bottom, 0)
-
         splitter.addWidget(left_widget)
         splitter.addWidget(right_widget)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 0)
+        splitter.setStretchFactor(0, 5)
+        splitter.setStretchFactor(1, 2)
 
         root.addWidget(splitter, 1)
         root.addWidget(self.main_status_bar, 0)
-
-        splitter.setSizes([1360, 390])
 
     def resize_columns_to_contents(self) -> None:
         self.device_table.resizeColumnsToContents()
