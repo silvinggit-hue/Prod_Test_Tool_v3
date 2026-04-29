@@ -5,3 +5,4 @@ __pycache__/
 dist/
 build/
 *.log
+_project_sources/
